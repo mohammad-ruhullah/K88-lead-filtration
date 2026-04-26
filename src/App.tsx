@@ -620,7 +620,7 @@ function App() {
                   }}
                   className="w-full rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm font-bold text-emerald-400 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-30"
                 >
-                  Download Recovered Assets
+                  Download Filtrated Assets
                 </button>
                 <div className="flex items-center gap-2">
                   <span
