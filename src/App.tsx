@@ -65,10 +65,10 @@ const FILE_STATUS_BADGE_STYLES: Record<FileRegistrationStatus, string> = {
 };
 
 const FILTER_STATUS_LABELS: Record<FilterRunStatus, string> = {
-  idle: 'Awaiting Discovery',
-  running: 'Discovering Assets...',
-  ready: 'Discovery Complete',
-  error: 'Discovery Failed',
+  idle: 'Awaiting Filtration',
+  running: 'Filtering Assets...',
+  ready: 'Filtration Complete',
+  error: 'Filtration Failed',
 };
 
 const FILTER_STATUS_BADGE_STYLES: Record<FilterRunStatus, string> = {
@@ -100,7 +100,7 @@ function App() {
 
   const [fileStatus, setFileStatus] = useState<FileRegistrationStatus>('idle');
   const [fileMessage, setFileMessage] = useState<string>(
-    'Upload local CSV files to begin the asset discovery process.',
+    'Upload local CSV files to begin the asset filtration process.',
   );
   const [fileError, setFileError] = useState<string | null>(null);
   const [registeredFiles, setRegisteredFiles] = useState<RegisteredCSVFile[]>([]);
@@ -110,14 +110,14 @@ function App() {
   const [filterCriteria, setFilterCriteria] = useState<FilterCriteria>(DEFAULT_FILTER_CRITERIA);
   const [filterStatus, setFilterStatus] = useState<FilterRunStatus>('idle');
   const [filterMessage, setFilterMessage] = useState<string>(
-    'Configure criteria and click "Run Discovery" to filter assets.',
+    'Configure criteria and click "Start Filtration" to filter assets.',
   );
   const [filterError, setFilterError] = useState<string | null>(null);
   const [filteredRowCount, setFilteredRowCount] = useState<string>('0');
   const [previewRows, setPreviewRows] = useState<PreviewRow[]>([]);
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle');
   const [exportMessage, setExportMessage] = useState<string>(
-    'Results can be exported once discovery is complete.',
+    'Results can be exported once filtration is complete.',
   );
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -208,7 +208,7 @@ function App() {
     resetExportState();
     setFilterStatus('running');
     setFilterError(null);
-    setFilterMessage('Building discovery index and materializing results...');
+    setFilterMessage('Building filtration index and materializing results...');
 
     const sourceSQL = buildUnionSourceSQL(
       registeredFiles.map((file) => file.virtualPath),
@@ -265,12 +265,12 @@ function App() {
       setFilterStatus('ready');
       setFilterError(null);
       setFilterMessage(
-        `Discovery complete. Found ${Number(countRow?.row_count ?? 0).toLocaleString()} assets meeting criteria.`,
+        `Filtration complete. Found ${Number(countRow?.row_count ?? 0).toLocaleString()} assets meeting criteria.`,
       );
     } catch (error) {
       setFilterStatus('error');
       setFilterError(toErrorMessage(error));
-      setFilterMessage('Discovery pipeline failed.');
+      setFilterMessage('Filtration pipeline failed.');
       setFilteredRowCount('0');
       setPreviewRows([]);
     }
@@ -483,7 +483,7 @@ function App() {
                     d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"
                   />
                 </svg>
-                Discovery Logic
+                Filtration Logic
               </h2>
               <div className="mt-6 space-y-4">
                 <div className="flex items-center gap-3 rounded-xl border border-white/5 bg-white/5 p-3">
@@ -574,7 +574,7 @@ function App() {
                         />
                       </svg>
                     )}
-                    {filterStatus === 'running' ? 'Discovering...' : 'Run Discovery'}
+                    {filterStatus === 'running' ? 'Filtering...' : 'Start Filtration'}
                   </div>
                 </button>
 
@@ -665,7 +665,7 @@ function App() {
             {/* Table Container */}
             <section className="flex flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/40 shadow-2xl">
               <div className="flex items-center justify-between border-b border-white/10 bg-white/5 px-6 py-4">
-                <h2 className="text-sm font-semibold text-white">Discovery Preview</h2>
+                <h2 className="text-sm font-semibold text-white">Filtration Preview</h2>
                 <p className="text-[10px] text-slate-400">Showing first 20 records</p>
               </div>
 
@@ -730,7 +730,7 @@ function App() {
                         />
                       </svg>
                     </div>
-                    <p className="text-sm font-medium text-slate-400">No data discovered yet</p>
+                    <p className="text-sm font-medium text-slate-400">No data filtered yet</p>
                     <p className="mt-1 text-xs text-slate-600">
                       Complete the steps on the left to analyze your assets.
                     </p>
