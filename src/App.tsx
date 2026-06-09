@@ -5,6 +5,7 @@ import {
   type DuckDBRuntimeStatus,
   type RegisteredCSVFile,
 } from './services/duckdbRuntime';
+import { airtableService } from './services/airtableService';
 
 type FileRegistrationStatus = 'idle' | 'processing' | 'ready' | 'error';
 type FilterRunStatus = 'idle' | 'running' | 'ready' | 'error';
@@ -92,11 +93,117 @@ const EXPORT_STATUS_BADGE_STYLES: Record<ExportStatus, string> = {
   error: 'bg-rose-500/10 text-rose-500 ring-rose-500/20',
 };
 
+// --- UI Components for Processing & Errors ---
+
+const ProcessingOverlay = ({ message }: { message: string }) => (
+  <div className="fixed inset-0 z-[100] flex items-center justify-center bg-[#020617]/80 backdrop-blur-sm">
+    <div className="flex flex-col items-center gap-4">
+      <div className="relative">
+        <div className="h-12 w-12 animate-spin rounded-full border-4 border-amber-500/20 border-t-amber-500" />
+        <div className="absolute inset-0 h-12 w-12 animate-pulse rounded-full bg-amber-500/10" />
+      </div>
+      <p className="text-sm font-medium text-amber-500">{message}</p>
+    </div>
+  </div>
+);
+
+const ErrorModal = ({ title, message, onClose }: { title: string; message: string; onClose: () => void }) => (
+  <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-md p-6">
+    <div className="w-full max-w-md overflow-hidden rounded-2xl border border-rose-500/20 bg-slate-900 shadow-2xl">
+      <div className="border-b border-rose-500/10 bg-rose-500/5 px-6 py-4">
+        <h3 className="flex items-center gap-2 text-lg font-bold text-rose-400">
+          <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+          </svg>
+          {title}
+        </h3>
+      </div>
+      <div className="p-6">
+        <p className="text-sm leading-relaxed text-slate-300">{message}</p>
+        <button
+          onClick={onClose}
+          className="mt-6 w-full rounded-xl bg-slate-800 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-700"
+        >
+          Dismiss
+        </button>
+      </div>
+    </div>
+  </div>
+);
+
+const SuccessModal = ({
+  count,
+  onDownload,
+  onClose,
+  isDownloading,
+}: {
+  count: string;
+  onDownload: () => void;
+  onClose: () => void;
+  isDownloading: boolean;
+}) => (
+  <div className="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 backdrop-blur-md p-6">
+    <div className="w-full max-w-md overflow-hidden rounded-3xl border border-emerald-500/20 bg-slate-900 shadow-[0_0_50px_rgba(16,185,129,0.1)]">
+      <div className="flex flex-col items-center p-8 text-center">
+        <div className="mb-6 flex h-20 w-20 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.2)]">
+          <svg className="h-10 w-10" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+          </svg>
+        </div>
+        
+        <h3 className="text-2xl font-bold text-white">Filtration Complete</h3>
+        <p className="mt-2 text-slate-400">Successfully processed and deduplicated all assets.</p>
+        
+        <div className="mt-8 flex flex-col items-center gap-1">
+          <span className="text-5xl font-black text-emerald-400">{Number(count).toLocaleString()}</span>
+          <span className="text-xs font-bold uppercase tracking-widest text-emerald-500/60">New Leads Qualified</span>
+        </div>
+
+        <div className="mt-10 grid w-full grid-cols-1 gap-3">
+          <button
+            onClick={onDownload}
+            disabled={isDownloading || count === '0'}
+            className="flex items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-6 py-4 text-sm font-bold text-black transition hover:bg-emerald-500 disabled:opacity-30"
+          >
+            {isDownloading ? (
+              <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+              </svg>
+            ) : (
+              <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+            )}
+            Download Qualified CSV
+          </button>
+          
+          <button
+            onClick={onClose}
+            className="rounded-2xl border border-white/5 bg-white/5 px-6 py-4 text-sm font-bold text-slate-400 transition hover:bg-white/10 hover:text-white"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+);
+
+const FIELD_PROPERTY_ID = (import.meta.env.VITE_AIRTABLE_FIELD_PROPERTY_ID || 'PROPERTY_ID').replace(/^["']|["']$/g, '');
+const FIELD_OWNER_NAME = (import.meta.env.VITE_AIRTABLE_FIELD_OWNER_NAME || 'OWNER_NAME').replace(/^["']|["']$/g, '');
+
 function App() {
   const [lifecycle, setLifecycle] = useState<DuckDBRuntimeLifecycle>(() =>
     duckDBRuntimeService.getLifecycle(),
   );
   const [duckDBVersion, setDuckDBVersion] = useState<string>('Pending');
+
+  // Processing & Error State
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [processingMessage, setProcessingMessage] = useState('');
+  const [errorModal, setErrorModal] = useState<{ title: string; message: string } | null>(null);
+  const [isSuccessModalOpen, setIsSuccessModalOpen] = useState(false);
 
   const [fileStatus, setFileStatus] = useState<FileRegistrationStatus>('idle');
   const [fileMessage, setFileMessage] = useState<string>(
@@ -116,10 +223,6 @@ function App() {
   const [filteredRowCount, setFilteredRowCount] = useState<string>('0');
   const [previewRows, setPreviewRows] = useState<PreviewRow[]>([]);
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle');
-  const [exportMessage, setExportMessage] = useState<string>(
-    'Results can be exported once filtration is complete.',
-  );
-  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     const unsubscribe = duckDBRuntimeService.subscribe(setLifecycle);
@@ -205,49 +308,89 @@ function App() {
       return;
     }
 
+    // Resolve actual CSV column names based on the reference header
+    const csvPropIdCol = findBestColumnMatch(referenceHeader, [FIELD_PROPERTY_ID, 'PROPERTY_ID', 'Property ID', 'PropertyID']);
+    const csvOwnerNameCol = findBestColumnMatch(referenceHeader, [FIELD_OWNER_NAME, 'OWNER_NAME', 'Owner Name', 'OwnerName']);
+    const csvCashBalanceCol = findBestColumnMatch(referenceHeader, ['CURRENT_CASH_BALANCE', 'Cash Balance', 'CashBalance', 'Balance']);
+
+    if (!csvPropIdCol || !csvOwnerNameCol || !csvCashBalanceCol) {
+      setFilterStatus('error');
+      const missing = [];
+      if (!csvPropIdCol) missing.push('Property ID');
+      if (!csvOwnerNameCol) missing.push('Owner Name');
+      if (!csvCashBalanceCol) missing.push('Cash Balance');
+      setFilterError(`Could not find required columns in CSV: ${missing.join(', ')}`);
+      return;
+    }
+
+    setIsProcessing(true);
     resetExportState();
     setFilterStatus('running');
     setFilterError(null);
-    setFilterMessage('Building filtration index and materializing results...');
-
-    const sourceSQL = buildUnionSourceSQL(
-      registeredFiles.map((file) => file.virtualPath),
-      referenceHeader
-    );
-    const minBalanceLiteral = toSQLNumericLiteral(filterCriteria.minCurrentCashBalance);
-
-    const dropTableSQL = `DROP TABLE IF EXISTS ${FILTERED_DATASET_VIEW_NAME}`;
-
-    const materializeSQL = `
-      CREATE TEMP TABLE ${FILTERED_DATASET_VIEW_NAME} AS
-      SELECT *
-      ${sourceSQL}
-      WHERE TRY_CAST("CURRENT_CASH_BALANCE" AS DOUBLE) >= ${minBalanceLiteral}
-    `;
-
-    const countSQL = `
-      SELECT COUNT(*)::BIGINT AS row_count
-      FROM ${FILTERED_DATASET_VIEW_NAME}
-    `;
-
-    const previewSQL = `
-      SELECT
-        "PROPERTY_ID",
-        "OWNER_NAME",
-        "OWNER_CITY",
-        "OWNER_STATE",
-        "CURRENT_CASH_BALANCE",
-        "HOLDER_NAME",
-        "HOLDER_CITY",
-        "HOLDER_STATE"
-      FROM ${FILTERED_DATASET_VIEW_NAME}
-      LIMIT 20
-    `;
 
     const connection = duckDBRuntimeService.getConnection();
 
     try {
+      // Step 1: Sync with Airtable
+      setProcessingMessage('Syncing with Airtable database...');
+      const existingLeads = await airtableService.fetchAllExistingLeads();
+
+      // Step 2: Register existing leads in DuckDB
+      setProcessingMessage('Analyzing duplicates...');
+      await duckDBRuntimeService.registerExistingLeads(existingLeads);
+
+      // Step 3: Run SQL Pipeline with Anti-Join
+      setProcessingMessage('Applying filtration rules and deduplicating...');
+      
+      const sourceSQL = buildUnionSourceSQL(
+        registeredFiles.map((file) => file.virtualPath),
+        referenceHeader
+      );
+      const minBalanceLiteral = toSQLNumericLiteral(filterCriteria.minCurrentCashBalance);
+
+      const dropTableSQL = `DROP TABLE IF EXISTS ${FILTERED_DATASET_VIEW_NAME}`;
+      const dropAirtableTableSQL = `DROP TABLE IF EXISTS airtable_leads_lookup`;
+
+      // Create a temporary table for Airtable leads for efficient joining
+      const createAirtableLookupSQL = `
+        CREATE TEMP TABLE airtable_leads_lookup AS 
+        SELECT * FROM read_csv_auto('airtable_existing_leads.csv', header=true)
+      `;
+
+      // The Materialize SQL now includes robust case-insensitive matching and dynamic column resolution
+      const materializeSQL = `
+        CREATE TEMP TABLE ${FILTERED_DATASET_VIEW_NAME} AS
+        SELECT csv.*
+        ${sourceSQL} AS csv
+        LEFT JOIN airtable_leads_lookup AS air
+          ON TRIM(UPPER(CAST(csv."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
+          AND TRIM(UPPER(CAST(csv."${csvOwnerNameCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."OWNER_NAME" AS VARCHAR)))
+        WHERE TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) >= ${minBalanceLiteral}
+          AND air."PROPERTY_ID" IS NULL
+      `;
+
+      const countSQL = `
+        SELECT COUNT(*)::BIGINT AS row_count
+        FROM ${FILTERED_DATASET_VIEW_NAME}
+      `;
+
+      const previewSQL = `
+        SELECT
+          "${csvPropIdCol}" AS "PROPERTY_ID",
+          "${csvOwnerNameCol}" AS "OWNER_NAME",
+          "${findBestColumnMatch(referenceHeader, ['OWNER_CITY', 'Owner City', 'City']) || csvOwnerNameCol}" AS "OWNER_CITY",
+          "${findBestColumnMatch(referenceHeader, ['OWNER_STATE', 'Owner State', 'State']) || csvOwnerNameCol}" AS "OWNER_STATE",
+          "${csvCashBalanceCol}" AS "CURRENT_CASH_BALANCE",
+          "${findBestColumnMatch(referenceHeader, ['HOLDER_NAME', 'Holder Name', 'Holder']) || csvOwnerNameCol}" AS "HOLDER_NAME",
+          "${findBestColumnMatch(referenceHeader, ['HOLDER_CITY', 'Holder City']) || csvOwnerNameCol}" AS "HOLDER_CITY",
+          "${findBestColumnMatch(referenceHeader, ['HOLDER_STATE', 'Holder State']) || csvOwnerNameCol}" AS "HOLDER_STATE"
+        FROM ${FILTERED_DATASET_VIEW_NAME}
+        LIMIT 20
+      `;
+
       await connection.query(dropTableSQL);
+      await connection.query(dropAirtableTableSQL);
+      await connection.query(createAirtableLookupSQL);
       await connection.query(materializeSQL);
 
       const countResult = await connection.query(countSQL);
@@ -265,14 +408,23 @@ function App() {
       setFilterStatus('ready');
       setFilterError(null);
       setFilterMessage(
-        `Filtration complete. Found ${Number(countRow?.row_count ?? 0).toLocaleString()} assets meeting criteria.`,
+        `Filtration complete. Found ${Number(countRow?.row_count ?? 0).toLocaleString()} new assets meeting criteria.`,
       );
+      setIsSuccessModalOpen(true);
     } catch (error) {
       setFilterStatus('error');
-      setFilterError(toErrorMessage(error));
+      const msg = toErrorMessage(error);
+      setFilterError(msg);
       setFilterMessage('Filtration pipeline failed.');
       setFilteredRowCount('0');
       setPreviewRows([]);
+      setErrorModal({
+        title: 'Filtration Pipeline Failed',
+        message: msg,
+      });
+    } finally {
+      setIsProcessing(false);
+      setProcessingMessage('');
     }
   };
 
@@ -284,31 +436,30 @@ function App() {
     const connection = duckDBRuntimeService.getConnection();
     const now = new Date();
     const formattedDate = now.toISOString().split('T')[0]; // YYYY-MM-DD
-    const downloadFileName = `K88_Qualified Lead_${formattedDate}_${filteredRowCount}.csv.gz`;
-    const virtualExportPath = `filtered_export_${Date.now()}.csv.gz`;
+    const downloadFileName = `K88_Qualified Lead_${formattedDate}_${filteredRowCount}.csv`;
+    const virtualExportPath = `filtered_export_${Date.now()}.csv`;
 
     setExportStatus('exporting');
-    setExportError(null);
-    setExportMessage('Compressing and preparing assets for download...');
 
     try {
       await connection.query(`
         COPY (
           SELECT *
           FROM ${FILTERED_DATASET_VIEW_NAME}
-        ) TO '${virtualExportPath}' (FORMAT csv, HEADER true, COMPRESSION gzip)
+        ) TO '${virtualExportPath}' (FORMAT csv, HEADER true)
       `);
 
-      const compressedBuffer = await duckDBRuntimeService.copyFileToBuffer(virtualExportPath);
-      downloadBufferAsFile(compressedBuffer, downloadFileName, 'application/gzip');
+      const buffer = await duckDBRuntimeService.copyFileToBuffer(virtualExportPath);
+      downloadBufferAsFile(buffer, downloadFileName, 'text/csv');
 
       setExportStatus('ready');
-      setExportError(null);
-      setExportMessage(`Downloaded ${downloadFileName}`);
     } catch (error) {
       setExportStatus('error');
-      setExportError(toErrorMessage(error));
-      setExportMessage('CSV export failed.');
+      const msg = toErrorMessage(error);
+      setErrorModal({
+        title: 'CSV Export Failed',
+        message: msg,
+      });
     } finally {
       try {
         await duckDBRuntimeService.dropFile(virtualExportPath);
@@ -324,17 +475,32 @@ function App() {
     setFilterError(null);
     setFilteredRowCount('0');
     setPreviewRows([]);
+    setIsSuccessModalOpen(false);
     resetExportState();
   };
 
   const resetExportState = (): void => {
     setExportStatus('idle');
-    setExportMessage('Run filter first, then download filtered dataset as CSV.');
-    setExportError(null);
   };
 
   return (
     <main className="min-h-screen bg-[#020617] text-slate-200 selection:bg-amber-500/30">
+      {isProcessing && <ProcessingOverlay message={processingMessage} />}
+      {errorModal && (
+        <ErrorModal
+          title={errorModal.title}
+          message={errorModal.message}
+          onClose={() => setErrorModal(null)}
+        />
+      )}
+      {isSuccessModalOpen && (
+        <SuccessModal
+          count={filteredRowCount}
+          onDownload={() => void downloadFilteredCSV()}
+          onClose={() => setIsSuccessModalOpen(false)}
+          isDownloading={exportStatus === 'exporting'}
+        />
+      )}
       {/* Navigation / Header */}
       <nav className="sticky top-0 z-50 border-b border-white/5 bg-[#020617]/80 backdrop-blur-xl">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
@@ -578,6 +744,29 @@ function App() {
                   </div>
                 </button>
 
+                {filterStatus === 'ready' && (
+                  <button
+                    type="button"
+                    disabled={exportStatus === 'exporting'}
+                    onClick={() => {
+                      void downloadFilteredCSV();
+                    }}
+                    className="flex w-full items-center justify-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm font-bold text-emerald-400 transition hover:bg-emerald-500/20 disabled:opacity-30"
+                  >
+                    {exportStatus === 'exporting' ? (
+                      <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                      </svg>
+                    ) : (
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                      </svg>
+                    )}
+                    Download Results (.csv)
+                  </button>
+                )}
+
                 <div className="flex items-center gap-2">
                   <span
                     className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${FILTER_STATUS_BADGE_STYLES[filterStatus]}`}
@@ -587,48 +776,6 @@ function App() {
                   <p className="truncate text-[10px] text-slate-500">
                     Minimum Cash Balance: ≥ ${filterCriteria.minCurrentCashBalance.toLocaleString()}
                   </p>
-                </div>
-              </div>
-            </section>
-
-            {/* Export Card */}
-            <section
-              className={`rounded-2xl border border-white/10 p-6 shadow-xl transition-all ${filterStatus === 'ready' ? 'bg-slate-900/40 opacity-100' : 'bg-slate-900/10 opacity-50'}`}
-            >
-              <h2 className="flex items-center gap-2 text-sm font-semibold text-white">
-                <svg
-                  className="h-4 w-4 text-emerald-500"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                  />
-                </svg>
-                Export Results
-              </h2>
-              <div className="mt-6 space-y-4">
-                <button
-                  type="button"
-                  disabled={filterStatus !== 'ready' || exportStatus === 'exporting'}
-                  onClick={() => {
-                    void downloadFilteredCSV();
-                  }}
-                  className="w-full rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm font-bold text-emerald-400 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-30"
-                >
-                  Download Filtrated Assets
-                </button>
-                <div className="flex items-center gap-2">
-                  <span
-                    className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${EXPORT_STATUS_BADGE_STYLES[exportStatus]}`}
-                  >
-                    {EXPORT_STATUS_LABELS[exportStatus]}
-                  </span>
-                  <p className="truncate text-[10px] text-slate-500">{exportMessage}</p>
                 </div>
               </div>
             </section>
@@ -743,6 +890,17 @@ function App() {
       </div>
     </main>
   );
+}
+
+function findBestColumnMatch(headers: string[], candidates: string[]): string | null {
+  const normalizedHeaders = headers.map((h) => h.toLowerCase().trim());
+  for (const candidate of candidates) {
+    const idx = normalizedHeaders.indexOf(candidate.toLowerCase().trim());
+    if (idx !== -1) {
+      return headers[idx];
+    }
+  }
+  return null;
 }
 
 function buildCSVColumnsLiteral(headerColumns: string[]): string {

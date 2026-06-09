@@ -166,6 +166,36 @@ class DuckDBRuntimeService {
     return [...nextRegisteredFiles];
   }
 
+  /**
+   * Registers a list of existing leads (from Airtable) as a virtual CSV file
+   * so DuckDB can perform an anti-join for deduplication.
+   */
+  async registerExistingLeads(leads: { propertyId: string; ownerName: string }[]): Promise<void> {
+    if (!this.db) {
+      throw new Error('DuckDB runtime is not initialized.');
+    }
+
+    const virtualPath = 'airtable_existing_leads.csv';
+    
+    // Create CSV content from leads
+    const header = 'PROPERTY_ID,OWNER_NAME\n';
+    const rows = leads
+      .map(
+        (l) =>
+          `"${l.propertyId.replace(/"/g, '""')}","${l.ownerName.replace(/"/g, '""')}"`
+      )
+      .join('\n');
+    
+    const blob = new Blob([header + rows], { type: 'text/csv' });
+    
+    await this.db.registerFileHandle(
+      virtualPath,
+      blob,
+      duckdb.DuckDBDataProtocol.BROWSER_FILEREADER,
+      true
+    );
+  }
+
   async clearRegisteredCSVFiles(): Promise<void> {
     if (!this.db) {
       this.registeredCSVFiles = [];
