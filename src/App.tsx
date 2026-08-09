@@ -6,6 +6,10 @@ import {
   type RegisteredCSVFile,
 } from './services/duckdbRuntime';
 import { airtableService } from './services/airtableService';
+import {
+  buildPropertyTypeFilterSQL,
+  resolvePropertyTypeColumns,
+} from './services/propertyTypePolicy';
 
 type FileRegistrationStatus = 'idle' | 'processing' | 'ready' | 'error';
 type FilterRunStatus = 'idle' | 'running' | 'ready' | 'error';
@@ -22,6 +26,7 @@ interface FilterCriteria {
 
 interface PreviewRow {
   PROPERTY_ID: string | null;
+  PROPERTY_TYPE: string | null;
   OWNER_NAME: string | null;
   OWNER_CITY: string | null;
   OWNER_STATE: string | null;
@@ -133,11 +138,13 @@ const ErrorModal = ({ title, message, onClose }: { title: string; message: strin
 
 const SuccessModal = ({
   count,
+  excludedCount,
   onDownload,
   onClose,
   isDownloading,
 }: {
   count: string;
+  excludedCount: string;
   onDownload: () => void;
   onClose: () => void;
   isDownloading: boolean;
@@ -157,6 +164,11 @@ const SuccessModal = ({
         <div className="mt-8 flex flex-col items-center gap-1">
           <span className="text-5xl font-black text-emerald-400">{Number(count).toLocaleString()}</span>
           <span className="text-xs font-bold uppercase tracking-widest text-emerald-500/60">New Leads Qualified</span>
+          {excludedCount !== '0' && (
+            <p className="mt-2 text-[10px] text-slate-500">
+              {Number(excludedCount).toLocaleString()} non-cash assets skipped by the cash-only rule
+            </p>
+          )}
         </div>
 
         <div className="mt-10 grid w-full grid-cols-1 gap-3">
@@ -221,6 +233,7 @@ function App() {
   );
   const [filterError, setFilterError] = useState<string | null>(null);
   const [filteredRowCount, setFilteredRowCount] = useState<string>('0');
+  const [excludedNonCashCount, setExcludedNonCashCount] = useState<string>('0');
   const [previewRows, setPreviewRows] = useState<PreviewRow[]>([]);
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle');
 
@@ -313,6 +326,9 @@ function App() {
     const csvOwnerNameCol = findBestColumnMatch(referenceHeader, [FIELD_OWNER_NAME, 'OWNER_NAME', 'Owner Name', 'OwnerName']);
     const csvCashBalanceCol = findBestColumnMatch(referenceHeader, ['CURRENT_CASH_BALANCE', 'Cash Balance', 'CashBalance', 'Balance']);
 
+    // Resolve property type + securities evidence columns for the cash-only rule
+    const propertyTypeColumns = resolvePropertyTypeColumns(referenceHeader);
+
     if (!csvPropIdCol || !csvOwnerNameCol || !csvCashBalanceCol) {
       setFilterStatus('error');
       const missing = [];
@@ -320,6 +336,14 @@ function App() {
       if (!csvOwnerNameCol) missing.push('Owner Name');
       if (!csvCashBalanceCol) missing.push('Cash Balance');
       setFilterError(`Could not find required columns in CSV: ${missing.join(', ')}`);
+      return;
+    }
+
+    if (!propertyTypeColumns.typeColumn) {
+      setFilterStatus('error');
+      setFilterError(
+        'Could not find the property type column (PROPERTY_TYPE) in CSV. It is required to enforce the cash-only rule, so filtration was blocked.',
+      );
       return;
     }
 
@@ -347,6 +371,8 @@ function App() {
         referenceHeader
       );
       const minBalanceLiteral = toSQLNumericLiteral(filterCriteria.minCurrentCashBalance);
+      const propertyTypeFilterSQL = buildPropertyTypeFilterSQL(propertyTypeColumns);
+      const csvTypeCol = propertyTypeColumns.typeColumn as string;
 
       const dropTableSQL = `DROP TABLE IF EXISTS ${FILTERED_DATASET_VIEW_NAME}`;
       const dropAirtableTableSQL = `DROP TABLE IF EXISTS airtable_leads_lookup`;
@@ -366,6 +392,7 @@ function App() {
           ON TRIM(UPPER(CAST(csv."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
           AND TRIM(UPPER(CAST(csv."${csvOwnerNameCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."OWNER_NAME" AS VARCHAR)))
         WHERE TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) >= ${minBalanceLiteral}
+          AND ${propertyTypeFilterSQL}
           AND air."PROPERTY_ID" IS NULL
       `;
 
@@ -374,9 +401,19 @@ function App() {
         FROM ${FILTERED_DATASET_VIEW_NAME}
       `;
 
+      const excludedCountSQL = `
+        SELECT COUNT(*)::BIGINT AS excluded_count
+        ${sourceSQL} AS csv
+        WHERE TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) >= ${minBalanceLiteral}
+          AND NOT (
+            ${propertyTypeFilterSQL}
+          )
+      `;
+
       const previewSQL = `
         SELECT
           "${csvPropIdCol}" AS "PROPERTY_ID",
+          "${csvTypeCol}" AS "PROPERTY_TYPE",
           "${csvOwnerNameCol}" AS "OWNER_NAME",
           "${findBestColumnMatch(referenceHeader, ['OWNER_CITY', 'Owner City', 'City']) || csvOwnerNameCol}" AS "OWNER_CITY",
           "${findBestColumnMatch(referenceHeader, ['OWNER_STATE', 'Owner State', 'State']) || csvOwnerNameCol}" AS "OWNER_STATE",
@@ -398,17 +435,25 @@ function App() {
         | { row_count?: string | number | bigint }
         | undefined;
 
+      const excludedCountResult = await connection.query(excludedCountSQL);
+      const excludedCountRow = excludedCountResult.toArray()[0]?.toJSON() as
+        | { excluded_count?: string | number | bigint }
+        | undefined;
+
       const previewResult = await connection.query(previewSQL);
       const nextPreviewRows = previewResult
         .toArray()
         .map((row) => row.toJSON() as PreviewRow);
 
       setFilteredRowCount(String(countRow?.row_count ?? 0));
+      setExcludedNonCashCount(String(excludedCountRow?.excluded_count ?? 0));
       setPreviewRows(nextPreviewRows);
       setFilterStatus('ready');
       setFilterError(null);
       setFilterMessage(
-        `Filtration complete. Found ${Number(countRow?.row_count ?? 0).toLocaleString()} new assets meeting criteria.`,
+        `Filtration complete. Found ${Number(countRow?.row_count ?? 0).toLocaleString()} new assets meeting criteria. ${Number(
+          excludedCountRow?.excluded_count ?? 0,
+        ).toLocaleString()} non-cash assets skipped.`,
       );
       setIsSuccessModalOpen(true);
     } catch (error) {
@@ -417,6 +462,7 @@ function App() {
       setFilterError(msg);
       setFilterMessage('Filtration pipeline failed.');
       setFilteredRowCount('0');
+      setExcludedNonCashCount('0');
       setPreviewRows([]);
       setErrorModal({
         title: 'Filtration Pipeline Failed',
@@ -474,6 +520,7 @@ function App() {
     setFilterMessage('Filter is configured but has not run yet.');
     setFilterError(null);
     setFilteredRowCount('0');
+    setExcludedNonCashCount('0');
     setPreviewRows([]);
     setIsSuccessModalOpen(false);
     resetExportState();
@@ -496,6 +543,7 @@ function App() {
       {isSuccessModalOpen && (
         <SuccessModal
           count={filteredRowCount}
+          excludedCount={excludedNonCashCount}
           onDownload={() => void downloadFilteredCSV()}
           onClose={() => setIsSuccessModalOpen(false)}
           isDownloading={exportStatus === 'exporting'}
@@ -777,6 +825,15 @@ function App() {
                     Minimum Cash Balance: ≥ ${filterCriteria.minCurrentCashBalance.toLocaleString()}
                   </p>
                 </div>
+
+                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
+                    Cash-Only Policy (Always On)
+                  </p>
+                  <p className="mt-1 text-xs text-slate-300">
+                    Securities and safe-deposit box properties are excluded automatically before any lead is counted.
+                  </p>
+                </div>
               </div>
             </section>
           </div>
@@ -796,6 +853,16 @@ function App() {
                   Attributes
                 </p>
                 <p className="mt-1 text-2xl font-bold text-white">{referenceHeader.length}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                  Skipped Non-Cash
+                </p>
+                <p
+                  className={`mt-1 text-2xl font-bold ${excludedNonCashCount !== '0' ? 'text-amber-400' : 'text-slate-600'}`}
+                >
+                  {Number(excludedNonCashCount).toLocaleString()}
+                </p>
               </div>
               <div className="col-span-2 rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
                 <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
@@ -824,6 +891,7 @@ function App() {
                         <th className="px-4 py-3 font-medium uppercase tracking-wider">
                           Property ID
                         </th>
+                        <th className="px-4 py-3 font-medium uppercase tracking-wider">Type</th>
                         <th className="px-4 py-3 font-medium uppercase tracking-wider">
                           Owner Name
                         </th>
@@ -842,6 +910,9 @@ function App() {
                         >
                           <td className="whitespace-nowrap px-4 py-3 font-mono text-[10px] text-slate-500">
                             {row.PROPERTY_ID}
+                          </td>
+                          <td className="max-w-[180px] truncate px-4 py-3 text-[10px] text-emerald-400/80">
+                            {row.PROPERTY_TYPE}
                           </td>
                           <td className="px-4 py-3 font-medium text-slate-100">{row.OWNER_NAME}</td>
                           <td className="px-4 py-3 text-slate-400">

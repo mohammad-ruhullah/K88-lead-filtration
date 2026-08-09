@@ -13,6 +13,9 @@ dist-ssr
 *.local
 .env
 
+# Large source dataset CSVs (never commit raw unclaimed-property data)
+*.csv
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
