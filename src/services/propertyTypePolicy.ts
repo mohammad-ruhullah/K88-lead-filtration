@@ -1,3 +1,5 @@
+import { envField, matchColumn, quoteColumn } from './columnResolver';
+
 export interface PropertyTypeColumnMapping {
   typeColumn: string | null;
   sharesColumn: string | null;
@@ -29,13 +31,10 @@ const DENY_KEYWORDS = [
 ];
 const DENY_KEYWORD_PATTERN = DENY_KEYWORDS.join('|');
 
-const FIELD_PROPERTY_TYPE = (import.meta.env.VITE_CSV_FIELD_PROPERTY_TYPE || '').replace(/^["']|["']$/g, '');
-const FIELD_SHARES_REPORTED = (import.meta.env.VITE_CSV_FIELD_SHARES_REPORTED || '').replace(/^["']|["']$/g, '');
-const FIELD_CUSIP = (import.meta.env.VITE_CSV_FIELD_CUSIP || '').replace(/^["']|["']$/g, '');
-const FIELD_NAME_OF_SECURITIES_REPORTED = (import.meta.env.VITE_CSV_FIELD_NAME_OF_SECURITIES_REPORTED || '').replace(
-  /^["']|["']$/g,
-  '',
-);
+const FIELD_PROPERTY_TYPE = envField(import.meta.env.VITE_CSV_FIELD_PROPERTY_TYPE);
+const FIELD_SHARES_REPORTED = envField(import.meta.env.VITE_CSV_FIELD_SHARES_REPORTED);
+const FIELD_CUSIP = envField(import.meta.env.VITE_CSV_FIELD_CUSIP);
+const FIELD_NAME_OF_SECURITIES_REPORTED = envField(import.meta.env.VITE_CSV_FIELD_NAME_OF_SECURITIES_REPORTED);
 
 const TYPE_COLUMN_CANDIDATES = [
   FIELD_PROPERTY_TYPE,
@@ -55,21 +54,6 @@ const SECURITIES_NAME_COLUMN_CANDIDATES = [
   'SECURITIES_NAME',
 ];
 
-function unique(values: string[]): string[] {
-  return [...new Set(values.filter((value) => value.length > 0))];
-}
-
-function matchColumn(headers: string[], candidates: string[]): string | null {
-  const normalizedHeaders = headers.map((header) => header.toLowerCase().trim());
-  for (const candidate of unique(candidates)) {
-    const index = normalizedHeaders.indexOf(candidate.toLowerCase().trim());
-    if (index !== -1) {
-      return headers[index];
-    }
-  }
-  return null;
-}
-
 export function resolvePropertyTypeColumns(headers: string[]): PropertyTypeColumnMapping {
   return {
     typeColumn: matchColumn(headers, TYPE_COLUMN_CANDIDATES),
@@ -79,12 +63,26 @@ export function resolvePropertyTypeColumns(headers: string[]): PropertyTypeColum
   };
 }
 
-function quoteColumn(columnName: string): string {
-  return `csv."${columnName.replace(/"/g, '""')}"`;
+/**
+ * The cash-only policy as its individual predicates, so the filtration report
+ * can attribute each rejected row to the exact rule that rejected it.
+ * `buildPropertyTypeFilterSQL` composes these, so the two can never drift.
+ *
+ * Each field is a predicate that is TRUE when the row is acceptable.
+ */
+export interface PropertyTypeFilterParts {
+  keywordSQL: string | null;
+  codeSQL: string | null;
+  sharesSQL: string | null;
+  cusipSQL: string | null;
+  securitiesNameSQL: string | null;
 }
 
-export function buildPropertyTypeFilterSQL(mapping: PropertyTypeColumnMapping): string {
-  const predicates: string[] = [];
+export function buildPropertyTypeFilterParts(
+  mapping: PropertyTypeColumnMapping,
+): PropertyTypeFilterParts {
+  let keywordSQL: string | null = null;
+  let codeSQL: string | null = null;
 
   if (mapping.typeColumn) {
     const typeRef = `lower(trim(try_cast(${quoteColumn(mapping.typeColumn)} as varchar)))`;
@@ -93,33 +91,44 @@ export function buildPropertyTypeFilterSQL(mapping: PropertyTypeColumnMapping): 
     const excludedMsList = EXCLUDED_MS_CODES.map((code) => `'${code}'`).join(', ');
     const specificList = CASH_SPECIFIC_CODES.map((code) => `'${code}'`).join(', ');
 
-    predicates.push(`(
-      NOT regexp_matches(${typeRef}, '${DENY_KEYWORD_PATTERN}')
-      AND (
-        (left(${codeRef}, 2) IN (${familyList}) AND ${codeRef} NOT IN (${excludedMsList}))
-        OR ${codeRef} IN (${specificList})
-      )
-    )`);
+    keywordSQL = `(NOT regexp_matches(${typeRef}, '${DENY_KEYWORD_PATTERN}'))`;
+    codeSQL = `(
+      (left(${codeRef}, 2) IN (${familyList}) AND ${codeRef} NOT IN (${excludedMsList}))
+      OR ${codeRef} IN (${specificList})
+    )`;
   }
 
-  if (mapping.sharesColumn) {
-    const ref = quoteColumn(mapping.sharesColumn);
-    predicates.push(`(
-      ${ref} IS NULL
-      OR try_cast(${ref} AS DOUBLE) IS NULL
-      OR try_cast(${ref} AS DOUBLE) <= 0
-    )`);
-  }
+  return {
+    keywordSQL,
+    codeSQL,
+    sharesSQL: mapping.sharesColumn
+      ? `(
+      ${quoteColumn(mapping.sharesColumn)} IS NULL
+      OR try_cast(${quoteColumn(mapping.sharesColumn)} AS DOUBLE) IS NULL
+      OR try_cast(${quoteColumn(mapping.sharesColumn)} AS DOUBLE) <= 0
+    )`
+      : null,
+    cusipSQL: mapping.cusipColumn
+      ? `(${quoteColumn(mapping.cusipColumn)} IS NULL OR trim(cast(${quoteColumn(mapping.cusipColumn)} AS VARCHAR)) = '')`
+      : null,
+    securitiesNameSQL: mapping.securitiesNameColumn
+      ? `(${quoteColumn(mapping.securitiesNameColumn)} IS NULL OR trim(cast(${quoteColumn(mapping.securitiesNameColumn)} AS VARCHAR)) = '')`
+      : null,
+  };
+}
 
-  if (mapping.cusipColumn) {
-    const ref = quoteColumn(mapping.cusipColumn);
-    predicates.push(`(${ref} IS NULL OR trim(cast(${ref} AS VARCHAR)) = '')`);
-  }
+export function buildPropertyTypeFilterSQL(mapping: PropertyTypeColumnMapping): string {
+  const parts = buildPropertyTypeFilterParts(mapping);
 
-  if (mapping.securitiesNameColumn) {
-    const ref = quoteColumn(mapping.securitiesNameColumn);
-    predicates.push(`(${ref} IS NULL OR trim(cast(${ref} AS VARCHAR)) = '')`);
-  }
+  const predicates = [
+    parts.keywordSQL && parts.codeSQL ? `(
+      ${parts.keywordSQL}
+      AND (${parts.codeSQL})
+    )` : null,
+    parts.sharesSQL,
+    parts.cusipSQL,
+    parts.securitiesNameSQL,
+  ].filter((predicate): predicate is string => Boolean(predicate));
 
   return predicates.join('\n      AND ');
 }

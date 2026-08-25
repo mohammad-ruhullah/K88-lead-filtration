@@ -7,9 +7,20 @@ import {
 } from './services/duckdbRuntime';
 import { airtableService } from './services/airtableService';
 import {
+  buildPropertyTypeFilterParts,
   buildPropertyTypeFilterSQL,
   resolvePropertyTypeColumns,
 } from './services/propertyTypePolicy';
+import {
+  buildAddressRequiredSQL,
+  buildClaimGateParts,
+  buildClaimGateSQL,
+  buildOwnerKeySQL,
+  collectMissingRequiredColumns,
+  resolveOwnerGroupingColumns,
+} from './services/ownerGroupingPolicy';
+import { matchColumn } from './services/columnResolver';
+import { FiltrationReport, type FiltrationReportData } from './components/FiltrationReport';
 
 type FileRegistrationStatus = 'idle' | 'processing' | 'ready' | 'error';
 type FilterRunStatus = 'idle' | 'running' | 'ready' | 'error';
@@ -28,12 +39,48 @@ interface PreviewRow {
   PROPERTY_ID: string | null;
   PROPERTY_TYPE: string | null;
   OWNER_NAME: string | null;
+  OWNER_STREET_1: string | null;
   OWNER_CITY: string | null;
   OWNER_STATE: string | null;
   CURRENT_CASH_BALANCE: string | number | null;
   HOLDER_NAME: string | null;
-  HOLDER_CITY: string | null;
-  HOLDER_STATE: string | null;
+  OWNER_GROUP_TOTAL: string | number | null;
+  OWNER_GROUP_PROPERTY_COUNT: string | number | null;
+  OWNER_GROUP_ID: string | number | null;
+}
+
+const EMPTY_REPORT: FiltrationReportData = {
+  rowsScanned: '0',
+  unreadableClaim: '0',
+  pendingClaim: '0',
+  paidClaim: '0',
+  noAddress: '0',
+  deniedKeyword: '0',
+  notCashCode: '0',
+  sharesReported: '0',
+  hasCusip: '0',
+  securitiesNamed: '0',
+  alreadyInCrm: '0',
+  belowThreshold: '0',
+  qualifiedRows: '0',
+  ownerGroupsFormed: '0',
+  ownersQualified: '0',
+  ownersBelowThreshold: '0',
+  unlockedByGrouping: '0',
+};
+
+/** Tile figures derived from the report, so both read from one source of truth. */
+function summarise(report: FiltrationReportData) {
+  const n = (value: string) => Number(value ?? 0);
+  return {
+    skippedClaimed: n(report.unreadableClaim) + n(report.pendingClaim) + n(report.paidClaim),
+    skippedNonCash:
+      n(report.deniedKeyword) +
+      n(report.notCashCode) +
+      n(report.sharesReported) +
+      n(report.hasCusip) +
+      n(report.securitiesNamed),
+  };
 }
 
 const DEFAULT_FILTER_CRITERIA: FilterCriteria = {
@@ -41,6 +88,8 @@ const DEFAULT_FILTER_CRITERIA: FilterCriteria = {
 };
 
 const FILTERED_DATASET_VIEW_NAME = 'merged_filtered_dataset';
+const ELIGIBLE_ROWS_TABLE_NAME = 'eligible_rows';
+const OWNER_TOTALS_TABLE_NAME = 'owner_totals';
 
 const RUNTIME_STATUS_LABELS: Record<DuckDBRuntimeStatus, string> = {
   idle: 'Idle',
@@ -139,12 +188,16 @@ const ErrorModal = ({ title, message, onClose }: { title: string; message: strin
 const SuccessModal = ({
   count,
   excludedCount,
+  ownerCount,
+  unlockedCount,
   onDownload,
   onClose,
   isDownloading,
 }: {
   count: string;
   excludedCount: string;
+  ownerCount: string;
+  unlockedCount: string;
   onDownload: () => void;
   onClose: () => void;
   isDownloading: boolean;
@@ -159,17 +212,37 @@ const SuccessModal = ({
         </div>
         
         <h3 className="text-2xl font-bold text-white">Filtration Complete</h3>
-        <p className="mt-2 text-slate-400">Successfully processed and deduplicated all assets.</p>
-        
+        <p className="mt-2 text-slate-400">Unclaimed cash assets, grouped by owner and deduplicated.</p>
+
         <div className="mt-8 flex flex-col items-center gap-1">
-          <span className="text-5xl font-black text-emerald-400">{Number(count).toLocaleString()}</span>
-          <span className="text-xs font-bold uppercase tracking-widest text-emerald-500/60">New Leads Qualified</span>
-          {excludedCount !== '0' && (
-            <p className="mt-2 text-[10px] text-slate-500">
-              {Number(excludedCount).toLocaleString()} non-cash assets skipped by the cash-only rule
-            </p>
-          )}
+          <span className="text-5xl font-black text-emerald-400">
+            {Number(ownerCount).toLocaleString()}
+          </span>
+          <span className="text-xs font-bold uppercase tracking-widest text-emerald-500/60">
+            Owners Qualified
+          </span>
+          <p className="mt-1 text-sm text-slate-400">
+            across {Number(count).toLocaleString()} properties
+          </p>
         </div>
+
+        {unlockedCount !== '0' && (
+          <div className="mt-6 w-full rounded-xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
+            <p className="text-lg font-bold text-amber-400">
+              {Number(unlockedCount).toLocaleString()}
+            </p>
+            <p className="text-[10px] leading-relaxed text-slate-400">
+              of these qualified <span className="font-semibold text-amber-400/80">only</span> by
+              combining multiple properties &mdash; every one would have been missed before.
+            </p>
+          </div>
+        )}
+
+        {excludedCount !== '0' && (
+          <p className="mt-4 text-[10px] text-slate-500">
+            {Number(excludedCount).toLocaleString()} non-cash assets skipped by the cash-only rule
+          </p>
+        )}
 
         <div className="mt-10 grid w-full grid-cols-1 gap-3">
           <button
@@ -202,9 +275,6 @@ const SuccessModal = ({
   </div>
 );
 
-const FIELD_PROPERTY_ID = (import.meta.env.VITE_AIRTABLE_FIELD_PROPERTY_ID || 'PROPERTY_ID').replace(/^["']|["']$/g, '');
-const FIELD_OWNER_NAME = (import.meta.env.VITE_AIRTABLE_FIELD_OWNER_NAME || 'OWNER_NAME').replace(/^["']|["']$/g, '');
-
 function App() {
   const [lifecycle, setLifecycle] = useState<DuckDBRuntimeLifecycle>(() =>
     duckDBRuntimeService.getLifecycle(),
@@ -234,6 +304,8 @@ function App() {
   const [filterError, setFilterError] = useState<string | null>(null);
   const [filteredRowCount, setFilteredRowCount] = useState<string>('0');
   const [excludedNonCashCount, setExcludedNonCashCount] = useState<string>('0');
+  const [report, setReport] = useState<FiltrationReportData>(EMPTY_REPORT);
+  const tiles = summarise(report);
   const [previewRows, setPreviewRows] = useState<PreviewRow[]>([]);
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle');
 
@@ -321,21 +393,20 @@ function App() {
       return;
     }
 
-    // Resolve actual CSV column names based on the reference header
-    const csvPropIdCol = findBestColumnMatch(referenceHeader, [FIELD_PROPERTY_ID, 'PROPERTY_ID', 'Property ID', 'PropertyID']);
-    const csvOwnerNameCol = findBestColumnMatch(referenceHeader, [FIELD_OWNER_NAME, 'OWNER_NAME', 'Owner Name', 'OwnerName']);
-    const csvCashBalanceCol = findBestColumnMatch(referenceHeader, ['CURRENT_CASH_BALANCE', 'Cash Balance', 'CashBalance', 'Balance']);
+    // Resolve owner identity, claim gate and address columns
+    const ownerColumns = resolveOwnerGroupingColumns(referenceHeader);
 
     // Resolve property type + securities evidence columns for the cash-only rule
     const propertyTypeColumns = resolvePropertyTypeColumns(referenceHeader);
 
-    if (!csvPropIdCol || !csvOwnerNameCol || !csvCashBalanceCol) {
+    // Hard-block rather than silently skipping a rule when a column is absent.
+    const missingColumns = collectMissingRequiredColumns(ownerColumns);
+    if (missingColumns.length > 0) {
       setFilterStatus('error');
-      const missing = [];
-      if (!csvPropIdCol) missing.push('Property ID');
-      if (!csvOwnerNameCol) missing.push('Owner Name');
-      if (!csvCashBalanceCol) missing.push('Cash Balance');
-      setFilterError(`Could not find required columns in CSV: ${missing.join(', ')}`);
+      setFilterError(
+        `Could not find required columns in CSV: ${missingColumns.join(', ')}. ` +
+          'These are needed for the claim gate, address rule and owner grouping, so filtration was blocked.',
+      );
       return;
     }
 
@@ -346,6 +417,10 @@ function App() {
       );
       return;
     }
+
+    const csvPropIdCol = ownerColumns.propertyIdColumn as string;
+    const csvOwnerNameCol = ownerColumns.ownerNameColumn as string;
+    const csvCashBalanceCol = ownerColumns.cashBalanceColumn as string;
 
     setIsProcessing(true);
     resetExportState();
@@ -372,28 +447,74 @@ function App() {
       );
       const minBalanceLiteral = toSQLNumericLiteral(filterCriteria.minCurrentCashBalance);
       const propertyTypeFilterSQL = buildPropertyTypeFilterSQL(propertyTypeColumns);
+      const claimGateSQL = buildClaimGateSQL(ownerColumns);
+      const addressRequiredSQL = buildAddressRequiredSQL(ownerColumns);
+      const ownerKeySQL = buildOwnerKeySQL(ownerColumns);
       const csvTypeCol = propertyTypeColumns.typeColumn as string;
 
-      const dropTableSQL = `DROP TABLE IF EXISTS ${FILTERED_DATASET_VIEW_NAME}`;
       const dropAirtableTableSQL = `DROP TABLE IF EXISTS airtable_leads_lookup`;
 
       // Create a temporary table for Airtable leads for efficient joining
       const createAirtableLookupSQL = `
-        CREATE TEMP TABLE airtable_leads_lookup AS 
-        SELECT * FROM read_csv_auto('airtable_existing_leads.csv', header=true)
+        CREATE TEMP TABLE airtable_leads_lookup AS
+        SELECT DISTINCT * FROM read_csv_auto('airtable_existing_leads.csv', header=true)
       `;
 
-      // The Materialize SQL now includes robust case-insensitive matching and dynamic column resolution
-      const materializeSQL = `
-        CREATE TEMP TABLE ${FILTERED_DATASET_VIEW_NAME} AS
-        SELECT csv.*
+      // Step A - a single CSV pass applying every row-level gate, in order:
+      //   claim gate -> address required -> cash-only policy -> Airtable dedupe.
+      // The dedupe deliberately runs BEFORE any summing, so a property already
+      // in the CRM can never help an owner reach the threshold.
+      const materializeEligibleSQL = `
+        CREATE TEMP TABLE ${ELIGIBLE_ROWS_TABLE_NAME} AS
+        SELECT
+          csv.*,
+          ${ownerKeySQL} AS __owner_key,
+          TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) AS __balance
         ${sourceSQL} AS csv
         LEFT JOIN airtable_leads_lookup AS air
           ON TRIM(UPPER(CAST(csv."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
           AND TRIM(UPPER(CAST(csv."${csvOwnerNameCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."OWNER_NAME" AS VARCHAR)))
-        WHERE TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) >= ${minBalanceLiteral}
+        WHERE ${claimGateSQL}
+          AND ${addressRequiredSQL}
           AND ${propertyTypeFilterSQL}
           AND air."PROPERTY_ID" IS NULL
+      `;
+
+      // Step B - owner totals summed over DISTINCT properties. A jointly held
+      // property emits one row per co-owner sharing a PROPERTY_ID, so summing
+      // rows would invent money that does not exist.
+      const materializeOwnerTotalsSQL = `
+        CREATE TEMP TABLE ${OWNER_TOTALS_TABLE_NAME} AS
+        WITH per_property AS (
+          SELECT
+            __owner_key,
+            "${csvPropIdCol}" AS __property_id,
+            MAX(__balance) AS __property_balance
+          FROM ${ELIGIBLE_ROWS_TABLE_NAME}
+          GROUP BY __owner_key, __property_id
+        )
+        SELECT
+          __owner_key,
+          SUM(COALESCE(__property_balance, 0)) AS __owner_total,
+          COUNT(*)::BIGINT AS __owner_property_count,
+          MAX(COALESCE(__property_balance, 0)) AS __max_property_balance
+        FROM per_property
+        GROUP BY __owner_key
+      `;
+
+      // Step C - keep EVERY row of a qualifying owner (small properties ride
+      // along) and order so an owner's properties sit on consecutive rows.
+      const materializeSQL = `
+        CREATE TEMP TABLE ${FILTERED_DATASET_VIEW_NAME} AS
+        SELECT
+          e.*,
+          t.__owner_total,
+          t.__owner_property_count,
+          DENSE_RANK() OVER (ORDER BY t.__owner_total DESC, e.__owner_key) AS __owner_group_id
+        FROM ${ELIGIBLE_ROWS_TABLE_NAME} e
+        JOIN ${OWNER_TOTALS_TABLE_NAME} t USING (__owner_key)
+        WHERE t.__owner_total >= ${minBalanceLiteral}
+        ORDER BY t.__owner_total DESC, e.__owner_key, e."${csvPropIdCol}"
       `;
 
       const countSQL = `
@@ -401,13 +522,87 @@ function App() {
         FROM ${FILTERED_DATASET_VIEW_NAME}
       `;
 
-      const excludedCountSQL = `
-        SELECT COUNT(*)::BIGINT AS excluded_count
-        ${sourceSQL} AS csv
-        WHERE TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) >= ${minBalanceLiteral}
-          AND NOT (
-            ${propertyTypeFilterSQL}
-          )
+      // One scan producing the full rejection funnel.
+      //
+      // Every predicate is evaluated exactly ONCE per row in the `flags`
+      // subquery, then aggregated over the resulting booleans. Repeating them
+      // inside a dozen FILTER clauses would re-run regexp_matches a dozen times
+      // per row across millions of rows.
+      //
+      // Each FILTER is conditioned on passing all PRIOR stages, which is what
+      // makes the reasons mutually exclusive and the funnel reconcile:
+      //   rows scanned - sum(all reasons) === qualified
+      //
+      // The CRM check uses EXISTS rather than a LEFT JOIN: a join would inflate
+      // COUNT(*) if the Airtable lookup held a duplicate (PROPERTY_ID,
+      // OWNER_NAME) pair, silently corrupting total_rows.
+      const claimParts = buildClaimGateParts(ownerColumns);
+      const typeParts = buildPropertyTypeFilterParts(propertyTypeColumns);
+      const flag = (sql: string | null): string => sql ?? 'TRUE';
+
+      const funnelSQL = `
+        WITH flags AS (
+          SELECT
+            ${claimParts.unreadableSQL} AS bad_claim,
+            ${flag(claimParts.pendingOkSQL)} AS pend_ok,
+            ${flag(claimParts.paidOkSQL)} AS paid_ok,
+            ${addressRequiredSQL} AS addr_ok,
+            ${flag(typeParts.keywordSQL)} AS kw_ok,
+            ${flag(typeParts.codeSQL)} AS code_ok,
+            ${flag(typeParts.sharesSQL)} AS sh_ok,
+            ${flag(typeParts.cusipSQL)} AS cu_ok,
+            ${flag(typeParts.securitiesNameSQL)} AS sn_ok,
+            EXISTS (
+              SELECT 1 FROM airtable_leads_lookup air
+              WHERE TRIM(UPPER(CAST(csv."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
+                AND TRIM(UPPER(CAST(csv."${csvOwnerNameCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."OWNER_NAME" AS VARCHAR)))
+            ) AS in_crm
+          ${sourceSQL} AS csv
+        ), staged AS (
+          SELECT
+            *,
+            (NOT bad_claim AND pend_ok AND paid_ok) AS ok_claim,
+            (kw_ok AND code_ok AND sh_ok AND cu_ok AND sn_ok) AS ok_cash
+          FROM flags
+        )
+        SELECT
+          COUNT(*)::BIGINT AS total_rows,
+          COUNT(*) FILTER (WHERE bad_claim)::BIGINT AS c_unreadable_claim,
+          COUNT(*) FILTER (WHERE NOT bad_claim AND NOT pend_ok)::BIGINT AS c_pending,
+          COUNT(*) FILTER (WHERE NOT bad_claim AND pend_ok AND NOT paid_ok)::BIGINT AS c_paid,
+          COUNT(*) FILTER (WHERE ok_claim AND NOT addr_ok)::BIGINT AS c_no_address,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND NOT kw_ok)::BIGINT AS c_denied_keyword,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND NOT code_ok)::BIGINT AS c_not_cash_code,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND code_ok AND NOT sh_ok)::BIGINT AS c_shares,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND code_ok AND sh_ok AND NOT cu_ok)::BIGINT AS c_cusip,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND code_ok AND sh_ok AND cu_ok AND NOT sn_ok)::BIGINT AS c_securities_named,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND in_crm)::BIGINT AS c_in_crm
+        FROM staged
+      `;
+
+      // Threshold stage and owner-level counts run on the already-materialised
+      // tables, so neither costs another pass over the CSVs.
+      const thresholdSQL = `
+        SELECT
+          COUNT(*) FILTER (WHERE t.__owner_total < ${minBalanceLiteral})::BIGINT AS rows_below_threshold,
+          COUNT(*) FILTER (WHERE t.__owner_total >= ${minBalanceLiteral})::BIGINT AS rows_qualified
+        FROM ${ELIGIBLE_ROWS_TABLE_NAME} e
+        JOIN ${OWNER_TOTALS_TABLE_NAME} t USING (__owner_key)
+      `;
+
+      // "Unlocked by grouping" = owners that qualify only because their
+      // properties were combined; no single property reached the threshold.
+      const ownerStatsSQL = `
+        SELECT
+          COUNT(*)::BIGINT AS owner_groups_formed,
+          COUNT(*) FILTER (WHERE __owner_total >= ${minBalanceLiteral})::BIGINT AS qualifying_owners,
+          COUNT(*) FILTER (WHERE __owner_total < ${minBalanceLiteral})::BIGINT AS owners_below_threshold,
+          COUNT(*) FILTER (
+            WHERE __owner_total >= ${minBalanceLiteral}
+              AND __owner_property_count > 1
+              AND __max_property_balance < ${minBalanceLiteral}
+          )::BIGINT AS unlocked_by_grouping
+        FROM ${OWNER_TOTALS_TABLE_NAME}
       `;
 
       const previewSQL = `
@@ -415,29 +610,52 @@ function App() {
           "${csvPropIdCol}" AS "PROPERTY_ID",
           "${csvTypeCol}" AS "PROPERTY_TYPE",
           "${csvOwnerNameCol}" AS "OWNER_NAME",
-          "${findBestColumnMatch(referenceHeader, ['OWNER_CITY', 'Owner City', 'City']) || csvOwnerNameCol}" AS "OWNER_CITY",
-          "${findBestColumnMatch(referenceHeader, ['OWNER_STATE', 'Owner State', 'State']) || csvOwnerNameCol}" AS "OWNER_STATE",
+          "${ownerColumns.street1Column}" AS "OWNER_STREET_1",
+          "${matchColumn(referenceHeader, ['OWNER_CITY', 'Owner City', 'City']) || csvOwnerNameCol}" AS "OWNER_CITY",
+          "${matchColumn(referenceHeader, ['OWNER_STATE', 'Owner State', 'State']) || csvOwnerNameCol}" AS "OWNER_STATE",
           "${csvCashBalanceCol}" AS "CURRENT_CASH_BALANCE",
-          "${findBestColumnMatch(referenceHeader, ['HOLDER_NAME', 'Holder Name', 'Holder']) || csvOwnerNameCol}" AS "HOLDER_NAME",
-          "${findBestColumnMatch(referenceHeader, ['HOLDER_CITY', 'Holder City']) || csvOwnerNameCol}" AS "HOLDER_CITY",
-          "${findBestColumnMatch(referenceHeader, ['HOLDER_STATE', 'Holder State']) || csvOwnerNameCol}" AS "HOLDER_STATE"
+          "${matchColumn(referenceHeader, ['HOLDER_NAME', 'Holder Name', 'Holder']) || csvOwnerNameCol}" AS "HOLDER_NAME",
+          __owner_total AS "OWNER_GROUP_TOTAL",
+          __owner_property_count AS "OWNER_GROUP_PROPERTY_COUNT",
+          __owner_group_id AS "OWNER_GROUP_ID"
         FROM ${FILTERED_DATASET_VIEW_NAME}
-        LIMIT 20
+        ORDER BY __owner_total DESC, __owner_key, "${csvPropIdCol}"
+        LIMIT 30
       `;
 
-      await connection.query(dropTableSQL);
+      await connection.query(`DROP TABLE IF EXISTS ${FILTERED_DATASET_VIEW_NAME}`);
+      await connection.query(`DROP TABLE IF EXISTS ${OWNER_TOTALS_TABLE_NAME}`);
+      await connection.query(`DROP TABLE IF EXISTS ${ELIGIBLE_ROWS_TABLE_NAME}`);
       await connection.query(dropAirtableTableSQL);
       await connection.query(createAirtableLookupSQL);
+
+      setProcessingMessage('Applying claim, address and cash-only rules...');
+      await connection.query(materializeEligibleSQL);
+
+      setProcessingMessage('Grouping properties by owner and totalling...');
+      await connection.query(materializeOwnerTotalsSQL);
       await connection.query(materializeSQL);
+
+      setProcessingMessage('Summarising results...');
 
       const countResult = await connection.query(countSQL);
       const countRow = countResult.toArray()[0]?.toJSON() as
         | { row_count?: string | number | bigint }
         | undefined;
 
-      const excludedCountResult = await connection.query(excludedCountSQL);
-      const excludedCountRow = excludedCountResult.toArray()[0]?.toJSON() as
-        | { excluded_count?: string | number | bigint }
+      const funnelResult = await connection.query(funnelSQL);
+      const funnelRow = funnelResult.toArray()[0]?.toJSON() as
+        | Record<string, string | number | bigint>
+        | undefined;
+
+      const thresholdResult = await connection.query(thresholdSQL);
+      const thresholdRow = thresholdResult.toArray()[0]?.toJSON() as
+        | Record<string, string | number | bigint>
+        | undefined;
+
+      const ownerStatsResult = await connection.query(ownerStatsSQL);
+      const ownerStatsRow = ownerStatsResult.toArray()[0]?.toJSON() as
+        | Record<string, string | number | bigint>
         | undefined;
 
       const previewResult = await connection.query(previewSQL);
@@ -445,15 +663,44 @@ function App() {
         .toArray()
         .map((row) => row.toJSON() as PreviewRow);
 
+      const cell = (
+        row: Record<string, string | number | bigint> | undefined,
+        key: string,
+      ): string => String(row?.[key] ?? 0);
+
+      const nextReport: FiltrationReportData = {
+        rowsScanned: cell(funnelRow, 'total_rows'),
+        unreadableClaim: cell(funnelRow, 'c_unreadable_claim'),
+        pendingClaim: cell(funnelRow, 'c_pending'),
+        paidClaim: cell(funnelRow, 'c_paid'),
+        noAddress: cell(funnelRow, 'c_no_address'),
+        deniedKeyword: cell(funnelRow, 'c_denied_keyword'),
+        notCashCode: cell(funnelRow, 'c_not_cash_code'),
+        sharesReported: cell(funnelRow, 'c_shares'),
+        hasCusip: cell(funnelRow, 'c_cusip'),
+        securitiesNamed: cell(funnelRow, 'c_securities_named'),
+        alreadyInCrm: cell(funnelRow, 'c_in_crm'),
+        belowThreshold: cell(thresholdRow, 'rows_below_threshold'),
+        qualifiedRows: String(countRow?.row_count ?? 0),
+        ownerGroupsFormed: cell(ownerStatsRow, 'owner_groups_formed'),
+        ownersQualified: cell(ownerStatsRow, 'qualifying_owners'),
+        ownersBelowThreshold: cell(ownerStatsRow, 'owners_below_threshold'),
+        unlockedByGrouping: cell(ownerStatsRow, 'unlocked_by_grouping'),
+      };
+
+      const qualifyingOwners = nextReport.ownersQualified;
+      const unlockedByGrouping = nextReport.unlockedByGrouping;
+
       setFilteredRowCount(String(countRow?.row_count ?? 0));
-      setExcludedNonCashCount(String(excludedCountRow?.excluded_count ?? 0));
+      setExcludedNonCashCount(String(summarise(nextReport).skippedNonCash));
+      setReport(nextReport);
       setPreviewRows(nextPreviewRows);
       setFilterStatus('ready');
       setFilterError(null);
       setFilterMessage(
-        `Filtration complete. Found ${Number(countRow?.row_count ?? 0).toLocaleString()} new assets meeting criteria. ${Number(
-          excludedCountRow?.excluded_count ?? 0,
-        ).toLocaleString()} non-cash assets skipped.`,
+        `Filtration complete. ${Number(qualifyingOwners).toLocaleString()} qualifying owners across ` +
+          `${Number(countRow?.row_count ?? 0).toLocaleString()} properties. ` +
+          `${Number(unlockedByGrouping).toLocaleString()} owners qualified only by combining their properties.`,
       );
       setIsSuccessModalOpen(true);
     } catch (error) {
@@ -463,6 +710,7 @@ function App() {
       setFilterMessage('Filtration pipeline failed.');
       setFilteredRowCount('0');
       setExcludedNonCashCount('0');
+      setReport(EMPTY_REPORT);
       setPreviewRows([]);
       setErrorModal({
         title: 'Filtration Pipeline Failed',
@@ -488,10 +736,19 @@ function App() {
     setExportStatus('exporting');
 
     try {
+      // A materialised table does not guarantee scan order, so the grouping
+      // order is re-stated here or it would be lost in the downloaded file.
+      // Internal helper columns are dropped; the group columns are exported
+      // under client-facing names alongside every original CSV column.
       await connection.query(`
         COPY (
-          SELECT *
+          SELECT
+            * EXCLUDE (__owner_key, __balance, __owner_total, __owner_property_count, __owner_group_id),
+            __owner_group_id AS "OWNER_GROUP_ID",
+            __owner_property_count AS "OWNER_GROUP_PROPERTY_COUNT",
+            __owner_total AS "OWNER_GROUP_TOTAL"
           FROM ${FILTERED_DATASET_VIEW_NAME}
+          ORDER BY __owner_group_id, __balance DESC
         ) TO '${virtualExportPath}' (FORMAT csv, HEADER true)
       `);
 
@@ -521,6 +778,7 @@ function App() {
     setFilterError(null);
     setFilteredRowCount('0');
     setExcludedNonCashCount('0');
+    setReport(EMPTY_REPORT);
     setPreviewRows([]);
     setIsSuccessModalOpen(false);
     resetExportState();
@@ -544,6 +802,8 @@ function App() {
         <SuccessModal
           count={filteredRowCount}
           excludedCount={excludedNonCashCount}
+          ownerCount={report.ownersQualified}
+          unlockedCount={report.unlockedByGrouping}
           onDownload={() => void downloadFilteredCSV()}
           onClose={() => setIsSuccessModalOpen(false)}
           isDownloading={exportStatus === 'exporting'}
@@ -715,13 +975,13 @@ function App() {
                     className="h-4 w-4 rounded border-white/10 bg-slate-800 text-amber-500 focus:ring-amber-500"
                   />
                   <label htmlFor="enableCustomRule" className="cursor-pointer text-xs font-medium text-slate-300">
-                    Do you want to change the Minimum Cash Balance?
+                    Do you want to change the Minimum Owner Total?
                   </label>
                 </div>
 
                 <div className={isCustomRuleEnabled ? 'opacity-100' : 'opacity-40 grayscale pointer-events-none'}>
                   <label className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
-                    Minimum Cash Balance
+                    Minimum Owner Total
                   </label>
                   <div className="mt-2 flex items-center gap-3">
                     <div className="relative flex-1">
@@ -743,7 +1003,7 @@ function App() {
                       />
                     </div>
                     <span className="shrink-0 rounded bg-amber-500/10 px-2 py-1 text-[10px] font-semibold text-amber-500">
-                      Minimum Cash Balance
+                      Per Owner
                     </span>
                   </div>
                 </div>
@@ -822,7 +1082,16 @@ function App() {
                     {FILTER_STATUS_LABELS[filterStatus]}
                   </span>
                   <p className="truncate text-[10px] text-slate-500">
-                    Minimum Cash Balance: ≥ ${filterCriteria.minCurrentCashBalance.toLocaleString()}
+                    Owner total: ≥ ${filterCriteria.minCurrentCashBalance.toLocaleString()}
+                  </p>
+                </div>
+
+                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
+                    Unclaimed Only (Always On)
+                  </p>
+                  <p className="mt-1 text-xs text-slate-300">
+                    Properties with any pending or paid claim are removed first, before any other rule runs.
                   </p>
                 </div>
 
@@ -834,6 +1103,20 @@ function App() {
                     Securities and safe-deposit box properties are excluded automatically before any lead is counted.
                   </p>
                 </div>
+
+                <div className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-sky-400">
+                    Owner Grouping (Always On)
+                  </p>
+                  <p className="mt-1 text-xs text-slate-300">
+                    Properties sharing an exact owner name and address count as one owner. An owner qualifies on
+                    their combined total, and all of their properties export together.
+                  </p>
+                  <p className="mt-2 text-[10px] text-slate-500">
+                    Rows without a street address are excluded. Properties already in Airtable are removed before
+                    totalling.
+                  </p>
+                </div>
               </div>
             </section>
           </div>
@@ -842,31 +1125,19 @@ function App() {
           <div className="space-y-6 lg:col-span-8">
             {/* Metrics Overview */}
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+              <div className="rounded-2xl border border-emerald-500/20 bg-slate-900/40 p-4 shadow-xl">
                 <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
-                  Total Assets
-                </p>
-                <p className="mt-1 text-2xl font-bold text-white">{registeredFiles.length}</p>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
-                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
-                  Attributes
-                </p>
-                <p className="mt-1 text-2xl font-bold text-white">{referenceHeader.length}</p>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
-                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
-                  Skipped Non-Cash
+                  Qualifying Owners
                 </p>
                 <p
-                  className={`mt-1 text-2xl font-bold ${excludedNonCashCount !== '0' ? 'text-amber-400' : 'text-slate-600'}`}
+                  className={`mt-1 text-2xl font-bold ${report.ownersQualified !== '0' ? 'text-emerald-400' : 'text-slate-600'}`}
                 >
-                  {Number(excludedNonCashCount).toLocaleString()}
+                  {Number(report.ownersQualified).toLocaleString()}
                 </p>
               </div>
-              <div className="col-span-2 rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
                 <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
-                  Recovered Leads
+                  Qualified Properties
                 </p>
                 <p
                   className={`mt-1 text-2xl font-bold ${filteredRowCount !== '0' ? 'text-emerald-400' : 'text-slate-600'}`}
@@ -874,13 +1145,76 @@ function App() {
                   {Number(filteredRowCount).toLocaleString()}
                 </p>
               </div>
+              <div className="col-span-2 rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4 shadow-xl">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-amber-500/70">
+                  Unlocked by Grouping
+                </p>
+                <p
+                  className={`mt-1 text-2xl font-bold ${report.unlockedByGrouping !== '0' ? 'text-amber-400' : 'text-slate-600'}`}
+                >
+                  {Number(report.unlockedByGrouping).toLocaleString()}
+                </p>
+                <p className="mt-1 text-[10px] text-slate-500">
+                  Owners qualified only by combining properties
+                </p>
+              </div>
             </div>
+
+            {/* Rejection funnel */}
+            <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                  Rows Scanned
+                </p>
+                <p className="mt-1 text-xl font-bold text-slate-300">
+                  {Number(report.rowsScanned).toLocaleString()}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                  Skipped Claimed
+                </p>
+                <p
+                  className={`mt-1 text-xl font-bold ${tiles.skippedClaimed > 0 ? 'text-rose-400/80' : 'text-slate-600'}`}
+                >
+                  {tiles.skippedClaimed.toLocaleString()}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                  Skipped No Address
+                </p>
+                <p
+                  className={`mt-1 text-xl font-bold ${report.noAddress !== '0' ? 'text-rose-400/80' : 'text-slate-600'}`}
+                >
+                  {Number(report.noAddress).toLocaleString()}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                  Skipped Non-Cash
+                </p>
+                <p
+                  className={`mt-1 text-xl font-bold ${excludedNonCashCount !== '0' ? 'text-amber-400' : 'text-slate-600'}`}
+                >
+                  {Number(excludedNonCashCount).toLocaleString()}
+                </p>
+              </div>
+            </div>
+
+            <FiltrationReport
+              data={report}
+              threshold={filterCriteria.minCurrentCashBalance}
+              hasRun={filterStatus === 'ready'}
+            />
 
             {/* Table Container */}
             <section className="flex flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-900/40 shadow-2xl">
               <div className="flex items-center justify-between border-b border-white/10 bg-white/5 px-6 py-4">
                 <h2 className="text-sm font-semibold text-white">Filtration Preview</h2>
-                <p className="text-[10px] text-slate-400">Showing first 20 records</p>
+                <p className="text-[10px] text-slate-400">
+                  First 30 records &middot; grouped by owner
+                </p>
               </div>
 
               <div className="relative min-h-[400px] flex-1 overflow-x-auto">
@@ -895,40 +1229,62 @@ function App() {
                         <th className="px-4 py-3 font-medium uppercase tracking-wider">
                           Owner Name
                         </th>
-                        <th className="px-4 py-3 font-medium uppercase tracking-wider">Location</th>
+                        <th className="px-4 py-3 font-medium uppercase tracking-wider">Address</th>
                         <th className="px-4 py-3 text-right font-medium uppercase tracking-wider">
                           Cash Balance
                         </th>
-                        <th className="px-4 py-3 font-medium uppercase tracking-wider">Holder</th>
+                        <th className="px-4 py-3 text-right font-medium uppercase tracking-wider">
+                          Owner Total
+                        </th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-white/5 text-slate-300">
-                      {previewRows.map((row, index) => (
-                        <tr
-                          key={`${row.PROPERTY_ID ?? 'row'}-${index}`}
-                          className="transition-colors hover:bg-white/[0.02]"
-                        >
-                          <td className="whitespace-nowrap px-4 py-3 font-mono text-[10px] text-slate-500">
-                            {row.PROPERTY_ID}
-                          </td>
-                          <td className="max-w-[180px] truncate px-4 py-3 text-[10px] text-emerald-400/80">
-                            {row.PROPERTY_TYPE}
-                          </td>
-                          <td className="px-4 py-3 font-medium text-slate-100">{row.OWNER_NAME}</td>
-                          <td className="px-4 py-3 text-slate-400">
-                            {row.OWNER_CITY}, {row.OWNER_STATE}
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-3 text-right font-mono font-bold text-emerald-400">
-                            $
-                            {typeof row.CURRENT_CASH_BALANCE === 'number'
-                              ? row.CURRENT_CASH_BALANCE.toLocaleString()
-                              : row.CURRENT_CASH_BALANCE}
-                          </td>
-                          <td className="max-w-[150px] truncate px-4 py-3 text-[10px] text-slate-500">
-                            {row.HOLDER_NAME}
-                          </td>
-                        </tr>
-                      ))}
+                    <tbody className="text-slate-300">
+                      {previewRows.map((row, index) => {
+                        const groupId = String(row.OWNER_GROUP_ID ?? '');
+                        const isFirstOfGroup =
+                          index === 0 || String(previewRows[index - 1].OWNER_GROUP_ID ?? '') !== groupId;
+                        const isBanded = Number(groupId) % 2 === 0;
+                        const propertyCount = Number(row.OWNER_GROUP_PROPERTY_COUNT ?? 0);
+
+                        return (
+                          <tr
+                            key={`${row.PROPERTY_ID ?? 'row'}-${index}`}
+                            className={`transition-colors hover:bg-white/[0.04] ${
+                              isBanded ? 'bg-white/[0.02]' : ''
+                            } ${isFirstOfGroup ? 'border-t border-amber-500/20' : ''}`}
+                          >
+                            <td className="whitespace-nowrap px-4 py-3 font-mono text-[10px] text-slate-500">
+                              {row.PROPERTY_ID}
+                            </td>
+                            <td className="max-w-[180px] truncate px-4 py-3 text-[10px] text-emerald-400/80">
+                              {row.PROPERTY_TYPE}
+                            </td>
+                            <td className="px-4 py-3 font-medium text-slate-100">
+                              {isFirstOfGroup ? (
+                                <div className="flex items-center gap-2">
+                                  <span>{row.OWNER_NAME}</span>
+                                  {propertyCount > 1 && (
+                                    <span className="shrink-0 rounded bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-bold text-amber-400">
+                                      {propertyCount} props
+                                    </span>
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="text-slate-600">↳ same owner</span>
+                              )}
+                            </td>
+                            <td className="max-w-[200px] truncate px-4 py-3 text-[10px] text-slate-400">
+                              {isFirstOfGroup ? `${row.OWNER_STREET_1}, ${row.OWNER_CITY} ${row.OWNER_STATE}` : ''}
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-slate-300">
+                              ${formatMoney(row.CURRENT_CASH_BALANCE)}
+                            </td>
+                            <td className="whitespace-nowrap px-4 py-3 text-right font-mono font-bold text-emerald-400">
+                              {isFirstOfGroup ? `$${formatMoney(row.OWNER_GROUP_TOTAL)}` : ''}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 ) : (
@@ -963,15 +1319,16 @@ function App() {
   );
 }
 
-function findBestColumnMatch(headers: string[], candidates: string[]): string | null {
-  const normalizedHeaders = headers.map((h) => h.toLowerCase().trim());
-  for (const candidate of candidates) {
-    const idx = normalizedHeaders.indexOf(candidate.toLowerCase().trim());
-    if (idx !== -1) {
-      return headers[idx];
-    }
+function formatMoney(value: string | number | null): string {
+  const numeric = typeof value === 'number' ? value : Number(value ?? 0);
+  if (!Number.isFinite(numeric)) {
+    return String(value ?? '');
   }
-  return null;
+
+  return numeric.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
 function buildCSVColumnsLiteral(headerColumns: string[]): string {
@@ -1006,18 +1363,6 @@ function buildUnionSourceSQL(
       escape = '"',
       columns = ${columnsLiteral}
     )
-  `;
-}
-
-function buildUnionSourceSQL_Simple(virtualPaths: string[]): string {
-  const quotedPaths = virtualPaths
-    .map((path) => `'${path.replace(/'/g, "''")}'`)
-    .join(', ');
-
-  return `
-    FROM read_csv([
-      ${quotedPaths}
-    ], union_by_name = true, header = true, auto_detect = true)
   `;
 }
 
