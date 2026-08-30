@@ -12,6 +12,13 @@ import {
   resolvePropertyTypeColumns,
 } from './services/propertyTypePolicy';
 import {
+  buildOwnerEntityFilterParts,
+  buildOwnerEntityFilterSQL,
+  buildOwnerNameNormalizationSQL,
+  collectMissingOwnerEntityColumns,
+  resolveOwnerEntityColumns,
+} from './services/ownerEntityPolicy';
+import {
   buildAddressRequiredSQL,
   buildClaimGateParts,
   buildClaimGateSQL,
@@ -60,6 +67,8 @@ const EMPTY_REPORT: FiltrationReportData = {
   sharesReported: '0',
   hasCusip: '0',
   securitiesNamed: '0',
+  entityKeyword: '0',
+  entityOrgName: '0',
   alreadyInCrm: '0',
   belowThreshold: '0',
   qualifiedRows: '0',
@@ -80,6 +89,7 @@ function summarise(report: FiltrationReportData) {
       n(report.sharesReported) +
       n(report.hasCusip) +
       n(report.securitiesNamed),
+    skippedNonIndividual: n(report.entityKeyword) + n(report.entityOrgName),
   };
 }
 
@@ -399,6 +409,9 @@ function App() {
     // Resolve property type + securities evidence columns for the cash-only rule
     const propertyTypeColumns = resolvePropertyTypeColumns(referenceHeader);
 
+    // Resolve the owner name column for the individual-owner-only rule
+    const ownerEntityColumns = resolveOwnerEntityColumns(referenceHeader);
+
     // Hard-block rather than silently skipping a rule when a column is absent.
     const missingColumns = collectMissingRequiredColumns(ownerColumns);
     if (missingColumns.length > 0) {
@@ -414,6 +427,16 @@ function App() {
       setFilterStatus('error');
       setFilterError(
         'Could not find the property type column (PROPERTY_TYPE) in CSV. It is required to enforce the cash-only rule, so filtration was blocked.',
+      );
+      return;
+    }
+
+    const missingEntityColumns = collectMissingOwnerEntityColumns(ownerEntityColumns);
+    if (missingEntityColumns.length > 0) {
+      setFilterStatus('error');
+      setFilterError(
+        `Could not find ${missingEntityColumns.join(', ')} in CSV. It is required to enforce the ` +
+          'individual-owner-only rule, so filtration was blocked.',
       );
       return;
     }
@@ -450,6 +473,8 @@ function App() {
       const claimGateSQL = buildClaimGateSQL(ownerColumns);
       const addressRequiredSQL = buildAddressRequiredSQL(ownerColumns);
       const ownerKeySQL = buildOwnerKeySQL(ownerColumns);
+      const ownerNameNormSQL = buildOwnerNameNormalizationSQL(ownerEntityColumns) as string;
+      const ownerEntitySQL = buildOwnerEntityFilterSQL(ownerEntityColumns, '__owner_norm');
       const csvTypeCol = propertyTypeColumns.typeColumn as string;
 
       const dropAirtableTableSQL = `DROP TABLE IF EXISTS airtable_leads_lookup`;
@@ -461,22 +486,33 @@ function App() {
       `;
 
       // Step A - a single CSV pass applying every row-level gate, in order:
-      //   claim gate -> address required -> cash-only policy -> Airtable dedupe.
+      //   claim gate -> address required -> cash-only policy ->
+      //   individual owners only -> Airtable dedupe.
       // The dedupe deliberately runs BEFORE any summing, so a property already
       // in the CRM can never help an owner reach the threshold.
+      //
+      // The scan CTE materialises the normalised owner name once; the entity
+      // predicate reads it six times, and re-deriving it per reference would
+      // re-run regexp_replace six times per row across millions of rows.
       const materializeEligibleSQL = `
         CREATE TEMP TABLE ${ELIGIBLE_ROWS_TABLE_NAME} AS
-        SELECT
-          csv.*,
-          ${ownerKeySQL} AS __owner_key,
-          TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) AS __balance
-        ${sourceSQL} AS csv
+        WITH scanned AS (
+          SELECT
+            csv.*,
+            ${ownerKeySQL} AS __owner_key,
+            TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) AS __balance,
+            ${ownerNameNormSQL} AS __owner_norm
+          ${sourceSQL} AS csv
+          WHERE ${claimGateSQL}
+            AND ${addressRequiredSQL}
+            AND ${propertyTypeFilterSQL}
+        )
+        SELECT s.* EXCLUDE (__owner_norm)
+        FROM scanned s
         LEFT JOIN airtable_leads_lookup AS air
-          ON TRIM(UPPER(CAST(csv."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
-          AND TRIM(UPPER(CAST(csv."${csvOwnerNameCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."OWNER_NAME" AS VARCHAR)))
-        WHERE ${claimGateSQL}
-          AND ${addressRequiredSQL}
-          AND ${propertyTypeFilterSQL}
+          ON TRIM(UPPER(CAST(s."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
+          AND TRIM(UPPER(CAST(s."${csvOwnerNameCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."OWNER_NAME" AS VARCHAR)))
+        WHERE ${ownerEntitySQL}
           AND air."PROPERTY_ID" IS NULL
       `;
 
@@ -538,6 +574,7 @@ function App() {
       // OWNER_NAME) pair, silently corrupting total_rows.
       const claimParts = buildClaimGateParts(ownerColumns);
       const typeParts = buildPropertyTypeFilterParts(propertyTypeColumns);
+      const entityParts = buildOwnerEntityFilterParts(ownerEntityColumns, 'owner_norm');
       const flag = (sql: string | null): string => sql ?? 'TRUE';
 
       const funnelSQL = `
@@ -552,6 +589,7 @@ function App() {
             ${flag(typeParts.sharesSQL)} AS sh_ok,
             ${flag(typeParts.cusipSQL)} AS cu_ok,
             ${flag(typeParts.securitiesNameSQL)} AS sn_ok,
+            ${ownerNameNormSQL} AS owner_norm,
             EXISTS (
               SELECT 1 FROM airtable_leads_lookup air
               WHERE TRIM(UPPER(CAST(csv."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
@@ -562,8 +600,13 @@ function App() {
           SELECT
             *,
             (NOT bad_claim AND pend_ok AND paid_ok) AS ok_claim,
-            (kw_ok AND code_ok AND sh_ok AND cu_ok AND sn_ok) AS ok_cash
+            (kw_ok AND code_ok AND sh_ok AND cu_ok AND sn_ok) AS ok_cash,
+            ${flag(entityParts.hardEntitySQL)} AS ent_hard_ok,
+            ${flag(entityParts.softEntitySQL)} AS ent_soft_ok
           FROM flags
+        ), gated AS (
+          SELECT *, (ent_hard_ok AND ent_soft_ok) AS ok_person
+          FROM staged
         )
         SELECT
           COUNT(*)::BIGINT AS total_rows,
@@ -576,8 +619,10 @@ function App() {
           COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND code_ok AND NOT sh_ok)::BIGINT AS c_shares,
           COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND code_ok AND sh_ok AND NOT cu_ok)::BIGINT AS c_cusip,
           COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND code_ok AND sh_ok AND cu_ok AND NOT sn_ok)::BIGINT AS c_securities_named,
-          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND in_crm)::BIGINT AS c_in_crm
-        FROM staged
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND NOT ent_hard_ok)::BIGINT AS c_entity_keyword,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ent_hard_ok AND NOT ent_soft_ok)::BIGINT AS c_entity_orgname,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ok_person AND in_crm)::BIGINT AS c_in_crm
+        FROM gated
       `;
 
       // Threshold stage and owner-level counts run on the already-materialised
@@ -629,7 +674,7 @@ function App() {
       await connection.query(dropAirtableTableSQL);
       await connection.query(createAirtableLookupSQL);
 
-      setProcessingMessage('Applying claim, address and cash-only rules...');
+      setProcessingMessage('Applying claim, address, cash-only and individual-owner rules...');
       await connection.query(materializeEligibleSQL);
 
       setProcessingMessage('Grouping properties by owner and totalling...');
@@ -679,6 +724,8 @@ function App() {
         sharesReported: cell(funnelRow, 'c_shares'),
         hasCusip: cell(funnelRow, 'c_cusip'),
         securitiesNamed: cell(funnelRow, 'c_securities_named'),
+        entityKeyword: cell(funnelRow, 'c_entity_keyword'),
+        entityOrgName: cell(funnelRow, 'c_entity_orgname'),
         alreadyInCrm: cell(funnelRow, 'c_in_crm'),
         belowThreshold: cell(thresholdRow, 'rows_below_threshold'),
         qualifiedRows: String(countRow?.row_count ?? 0),
@@ -1104,6 +1151,20 @@ function App() {
                   </p>
                 </div>
 
+                <div className="rounded-xl border border-fuchsia-500/20 bg-fuchsia-500/5 p-3">
+                  <p className="text-[10px] font-semibold uppercase tracking-wider text-fuchsia-400">
+                    Individual Owners Only (Always On)
+                  </p>
+                  <p className="mt-1 text-xs text-slate-300">
+                    Records owned by companies, LLCs, trusts, estates, banks, churches, funds and government
+                    bodies are removed. Only natural persons are exported.
+                  </p>
+                  <p className="mt-2 text-[10px] text-slate-500">
+                    Surnames that double as business words (Church, Banks, Temple, Lodge, Co) are kept when the
+                    name reads as a person.
+                  </p>
+                </div>
+
                 <div className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-3">
                   <p className="text-[10px] font-semibold uppercase tracking-wider text-sky-400">
                     Owner Grouping (Always On)
@@ -1161,7 +1222,7 @@ function App() {
             </div>
 
             {/* Rejection funnel */}
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
               <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
                 <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
                   Rows Scanned
@@ -1198,6 +1259,16 @@ function App() {
                   className={`mt-1 text-xl font-bold ${excludedNonCashCount !== '0' ? 'text-amber-400' : 'text-slate-600'}`}
                 >
                   {Number(excludedNonCashCount).toLocaleString()}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-4 shadow-xl">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-slate-500">
+                  Skipped Non-Individual
+                </p>
+                <p
+                  className={`mt-1 text-xl font-bold ${tiles.skippedNonIndividual > 0 ? 'text-fuchsia-400' : 'text-slate-600'}`}
+                >
+                  {tiles.skippedNonIndividual.toLocaleString()}
                 </p>
               </div>
             </div>
