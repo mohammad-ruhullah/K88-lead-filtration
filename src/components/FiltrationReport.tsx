@@ -1,11 +1,19 @@
 /**
- * Filtration report: the total lead count, then how many each stage removed.
+ * Filtration report: the total lead count, then how many each stage removed,
+ * then the three numbers that describe the result - exported rows, distinct
+ * properties, and how many individual owners those properties belong to.
  *
  * The stages are mutually exclusive and evaluated in pipeline order, so
  * `rowsScanned - sum(all stages) === qualifiedRows` always holds. That check
  * still runs on every render but is deliberately silent when it passes - the
  * report is meant to be read at a glance. It only speaks up when the numbers
  * do not add up, because a silent wrong number is worse than a visible one.
+ *
+ * The result band sits OUTSIDE that arithmetic. Rows, properties and owners
+ * are three different units - a jointly-held property emits one row per
+ * co-owner, and one owner can hold many properties - so none of them belong
+ * in the `Remaining` column, where they would read as if the subtraction
+ * continued. They are stated with their units instead.
  */
 
 export interface FiltrationReportData {
@@ -31,6 +39,7 @@ export interface FiltrationReportData {
   belowThreshold: string;
   // Survivors
   qualifiedRows: string;
+  qualifiedProperties: string;
   // Owner-level
   ownerGroupsFormed: string;
   ownersQualified: string;
@@ -99,6 +108,11 @@ export function FiltrationReport({
 }) {
   const scanned = num(data.rowsScanned);
   const qualified = num(data.qualifiedRows);
+  // Counted over DISTINCT owner groups and DISTINCT property ids respectively,
+  // so these answer "how many properties" and "how many people to contact" -
+  // neither of which is the exported row count.
+  const properties = num(data.qualifiedProperties);
+  const owners = num(data.ownersQualified);
   const lines = buildLines(data, threshold);
   const totalRemoved = lines.reduce((sum, line) => sum + line.removed, 0);
   const reconciles = scanned - totalRemoved === qualified;
@@ -166,6 +180,27 @@ export function FiltrationReport({
             </tr>
           </tbody>
         </table>
+      </div>
+
+      {/* Result, stated in the three units that matter. Deliberately outside
+          the table so no figure here can be read as continuing the
+          Removed/Remaining subtraction. */}
+      <div className="grid grid-cols-1 border-t border-white/10 bg-emerald-500/5 sm:grid-cols-3">
+        {[
+          { label: 'Qualified rows (exported)', value: qualified },
+          { label: 'Distinct properties', value: properties },
+          { label: 'Individual owners to reach', value: owners },
+        ].map((item) => (
+          <div
+            key={item.label}
+            className="border-t border-white/5 px-6 py-4 first:border-t-0 sm:border-l sm:border-t-0 sm:first:border-l-0"
+          >
+            <p className="text-[10px] uppercase tracking-wider text-slate-500">{item.label}</p>
+            <p className="mt-1 font-mono text-xl font-bold text-emerald-400">
+              {item.value.toLocaleString()}
+            </p>
+          </div>
+        ))}
       </div>
 
       {!reconciles && (

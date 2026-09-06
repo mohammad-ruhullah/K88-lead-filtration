@@ -72,6 +72,7 @@ const EMPTY_REPORT: FiltrationReportData = {
   alreadyInCrm: '0',
   belowThreshold: '0',
   qualifiedRows: '0',
+  qualifiedProperties: '0',
   ownerGroupsFormed: '0',
   ownersQualified: '0',
   ownersBelowThreshold: '0',
@@ -553,8 +554,14 @@ function App() {
         ORDER BY t.__owner_total DESC, e.__owner_key, e."${csvPropIdCol}"
       `;
 
+      // Rows and properties are NOT the same number: a jointly-held property
+      // emits one row per co-owner, so it appears once per owner in the
+      // export. COUNT(DISTINCT) is what "how many properties" actually means.
+      // This runs on the materialised temp table, so it costs no CSV read.
       const countSQL = `
-        SELECT COUNT(*)::BIGINT AS row_count
+        SELECT
+          COUNT(*)::BIGINT AS row_count,
+          COUNT(DISTINCT "${csvPropIdCol}")::BIGINT AS distinct_property_count
         FROM ${FILTERED_DATASET_VIEW_NAME}
       `;
 
@@ -729,6 +736,7 @@ function App() {
         alreadyInCrm: cell(funnelRow, 'c_in_crm'),
         belowThreshold: cell(thresholdRow, 'rows_below_threshold'),
         qualifiedRows: String(countRow?.row_count ?? 0),
+        qualifiedProperties: String(countRow?.distinct_property_count ?? 0),
         ownerGroupsFormed: cell(ownerStatsRow, 'owner_groups_formed'),
         ownersQualified: cell(ownerStatsRow, 'qualifying_owners'),
         ownersBelowThreshold: cell(ownerStatsRow, 'owners_below_threshold'),
@@ -746,7 +754,7 @@ function App() {
       setFilterError(null);
       setFilterMessage(
         `Filtration complete. ${Number(qualifyingOwners).toLocaleString()} qualifying owners across ` +
-          `${Number(countRow?.row_count ?? 0).toLocaleString()} properties. ` +
+          `${Number(countRow?.distinct_property_count ?? 0).toLocaleString()} properties. ` +
           `${Number(unlockedByGrouping).toLocaleString()} owners qualified only by combining their properties.`,
       );
       setIsSuccessModalOpen(true);
