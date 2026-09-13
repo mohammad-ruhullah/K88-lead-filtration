@@ -801,7 +801,8 @@ function App() {
             * EXCLUDE (__owner_key, __balance, __owner_total, __owner_property_count, __owner_group_id),
             __owner_group_id AS "OWNER_GROUP_ID",
             __owner_property_count AS "OWNER_GROUP_PROPERTY_COUNT",
-            __owner_total AS "OWNER_GROUP_TOTAL"
+            __owner_total AS "OWNER_GROUP_TOTAL",
+            __owner_key AS "OWNER_KEY"
           FROM ${FILTERED_DATASET_VIEW_NAME}
           ORDER BY __owner_group_id, __balance DESC
         ) TO '${virtualExportPath}' (FORMAT csv, HEADER true)
