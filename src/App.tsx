@@ -442,6 +442,22 @@ function App() {
       return;
     }
 
+    // Resolve the co-owner count column used to split each owner's properties
+    // into individually owned vs co-owned.
+    const csvNoOfOwnersCol = matchColumn(referenceHeader, [
+      'NO_OF_OWNERS',
+      'No of Owners',
+      'Number of Owners',
+    ]);
+    if (!csvNoOfOwnersCol) {
+      setFilterStatus('error');
+      setFilterError(
+        'Could not find the number of owners column (NO_OF_OWNERS) in CSV. It is required to count ' +
+          'individual vs co-owned properties per owner, so filtration was blocked.',
+      );
+      return;
+    }
+
     const csvPropIdCol = ownerColumns.propertyIdColumn as string;
     const csvOwnerNameCol = ownerColumns.ownerNameColumn as string;
     const csvCashBalanceCol = ownerColumns.cashBalanceColumn as string;
@@ -502,6 +518,7 @@ function App() {
             csv.*,
             ${ownerKeySQL} AS __owner_key,
             TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) AS __balance,
+            TRY_CAST(csv."${csvNoOfOwnersCol}" AS INTEGER) AS __no_of_owners,
             ${ownerNameNormSQL} AS __owner_norm
           ${sourceSQL} AS csv
           WHERE ${claimGateSQL}
@@ -526,7 +543,8 @@ function App() {
           SELECT
             __owner_key,
             "${csvPropIdCol}" AS __property_id,
-            MAX(__balance) AS __property_balance
+            MAX(__balance) AS __property_balance,
+            MAX(__no_of_owners) AS __property_owners
           FROM ${ELIGIBLE_ROWS_TABLE_NAME}
           GROUP BY __owner_key, __property_id
         )
@@ -534,6 +552,10 @@ function App() {
           __owner_key,
           SUM(COALESCE(__property_balance, 0)) AS __owner_total,
           COUNT(*)::BIGINT AS __owner_property_count,
+          -- An unreadable owner count is treated as individually owned, so the
+          -- two splits always add up to __owner_property_count.
+          COUNT(*) FILTER (WHERE COALESCE(__property_owners, 1) <= 1)::BIGINT AS __owner_individual_count,
+          COUNT(*) FILTER (WHERE __property_owners > 1)::BIGINT AS __owner_co_owned_count,
           MAX(COALESCE(__property_balance, 0)) AS __max_property_balance
         FROM per_property
         GROUP BY __owner_key
@@ -547,6 +569,8 @@ function App() {
           e.*,
           t.__owner_total,
           t.__owner_property_count,
+          t.__owner_individual_count,
+          t.__owner_co_owned_count,
           DENSE_RANK() OVER (ORDER BY t.__owner_total DESC, e.__owner_key) AS __owner_group_id
         FROM ${ELIGIBLE_ROWS_TABLE_NAME} e
         JOIN ${OWNER_TOTALS_TABLE_NAME} t USING (__owner_key)
@@ -795,16 +819,22 @@ function App() {
       // order is re-stated here or it would be lost in the downloaded file.
       // Internal helper columns are dropped; the group columns are exported
       // under client-facing names alongside every original CSV column.
+      // The owner rank is not exported (the client sorts in Airtable), but the
+      // file keeps the same highest-total-first order the rank produced.
       await connection.query(`
         COPY (
           SELECT
-            * EXCLUDE (__owner_key, __balance, __owner_total, __owner_property_count, __owner_group_id),
-            __owner_group_id AS "OWNER_GROUP_ID",
-            __owner_property_count AS "OWNER_GROUP_PROPERTY_COUNT",
-            __owner_total AS "OWNER_GROUP_TOTAL",
+            * EXCLUDE (
+              __owner_key, __balance, __no_of_owners, __owner_total, __owner_property_count,
+              __owner_individual_count, __owner_co_owned_count, __owner_group_id
+            ),
+            __owner_property_count AS "OWNER_TOTAL_PROPERTY_COUNT",
+            __owner_individual_count AS "OWNER_INDIVIDUAL_PROPERTY_COUNT",
+            __owner_co_owned_count AS "OWNER_CO_OWNED_PROPERTY_COUNT",
+            __owner_total AS "OWNER_ALL_PROPERTY_TOTAL_AMOUNT",
             __owner_key AS "OWNER_KEY"
           FROM ${FILTERED_DATASET_VIEW_NAME}
-          ORDER BY __owner_group_id, __balance DESC
+          ORDER BY __owner_total DESC, __owner_key, __balance DESC
         ) TO '${virtualExportPath}' (FORMAT csv, HEADER true)
       `);
 
