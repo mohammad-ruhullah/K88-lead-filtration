@@ -33,9 +33,13 @@ export interface FiltrationReportData {
   // Stage 4 - individual owners only
   entityKeyword: string;
   entityOrgName: string;
-  // Stage 5 - CRM dedupe
+  // Stage 5 - sole owners only
+  coOwnerReported: string;
+  coOwnerShared: string;
+  coOwnerJointName: string;
+  // Stage 6 - CRM dedupe
   alreadyInCrm: string;
-  // Stage 6 - owner threshold
+  // Stage 7 - owner threshold
   belowThreshold: string;
   // Survivors
   qualifiedRows: string;
@@ -85,6 +89,11 @@ function buildLines(data: FiltrationReportData, threshold: number): ReportLine[]
     {
       label: 'Owner is not a person',
       removed: num(data.entityKeyword) + num(data.entityOrgName),
+    },
+    {
+      label: 'Property has co-owners',
+      removed:
+        num(data.coOwnerReported) + num(data.coOwnerShared) + num(data.coOwnerJointName),
     },
     {
       label: 'Already in Airtable',

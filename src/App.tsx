@@ -19,6 +19,14 @@ import {
   resolveOwnerEntityColumns,
 } from './services/ownerEntityPolicy';
 import {
+  buildCoOwnershipFilterParts,
+  buildCoOwnershipFilterSQL,
+  buildCoOwnershipFlagParts,
+  collectMissingCoOwnershipColumns,
+  resolveCoOwnershipColumns,
+  type CoOwnershipFlagRefs,
+} from './services/coOwnershipPolicy';
+import {
   buildAddressRequiredSQL,
   buildClaimGateParts,
   buildClaimGateSQL,
@@ -69,6 +77,9 @@ const EMPTY_REPORT: FiltrationReportData = {
   securitiesNamed: '0',
   entityKeyword: '0',
   entityOrgName: '0',
+  coOwnerReported: '0',
+  coOwnerShared: '0',
+  coOwnerJointName: '0',
   alreadyInCrm: '0',
   belowThreshold: '0',
   qualifiedRows: '0',
@@ -458,6 +469,18 @@ function App() {
       return;
     }
 
+    // Resolve the columns backing the sole-owner-only rule.
+    const coOwnershipColumns = resolveCoOwnershipColumns(referenceHeader);
+    const missingCoOwnershipColumns = collectMissingCoOwnershipColumns(coOwnershipColumns);
+    if (missingCoOwnershipColumns.length > 0) {
+      setFilterStatus('error');
+      setFilterError(
+        `Could not find ${missingCoOwnershipColumns.join(', ')} in CSV. These are required to ` +
+          'enforce the sole-owner-only rule, so filtration was blocked.',
+      );
+      return;
+    }
+
     const csvPropIdCol = ownerColumns.propertyIdColumn as string;
     const csvOwnerNameCol = ownerColumns.ownerNameColumn as string;
     const csvCashBalanceCol = ownerColumns.cashBalanceColumn as string;
@@ -494,6 +517,22 @@ function App() {
       const ownerEntitySQL = buildOwnerEntityFilterSQL(ownerEntityColumns, '__owner_norm');
       const csvTypeCol = propertyTypeColumns.typeColumn as string;
 
+      // Sole-owner-only rule. The flag expressions go in an UNFILTERED scan
+      // CTE and the predicates read the resulting columns - computing the
+      // per-property owner count after any WHERE would turn a co-owned
+      // property whose co-owner was already dropped into a fake sole owner.
+      // The flags are selected in the same CTE that derives the normalised
+      // name, so the joint-name test inlines its own normalisation rather than
+      // referencing a sibling alias in the same SELECT list.
+      const coOwnerFlags = buildCoOwnershipFlagParts(coOwnershipColumns);
+      const eligibleCoOwnerRefs: CoOwnershipFlagRefs = {
+        propertyRowCountRef: '__property_row_count',
+        ownerRowCountRef: '__owner_row_count',
+        jointNameRef: '__joint_name',
+        reportedOwnersRef: '__no_of_owners',
+      };
+      const coOwnershipSQL = buildCoOwnershipFilterSQL(eligibleCoOwnerRefs);
+
       const dropAirtableTableSQL = `DROP TABLE IF EXISTS airtable_leads_lookup`;
 
       // Create a temporary table for Airtable leads for efficient joining
@@ -504,7 +543,14 @@ function App() {
 
       // Step A - a single CSV pass applying every row-level gate, in order:
       //   claim gate -> address required -> cash-only policy ->
-      //   individual owners only -> Airtable dedupe.
+      //   individual owners only -> sole owners only -> Airtable dedupe.
+      //
+      // The `raw` CTE is deliberately UNFILTERED: the per-property owner counts
+      // behind the sole-owner rule are window functions, and SQL evaluates
+      // those after WHERE. Computing them in a filtered CTE would count only
+      // surviving rows, so a co-owned property whose co-owner was already
+      // dropped (entity owner, claimed, no address, non-cash) would read as
+      // sole-owned and pass the very rule meant to remove it.
       // The dedupe deliberately runs BEFORE any summing, so a property already
       // in the CRM can never help an owner reach the threshold.
       //
@@ -513,24 +559,34 @@ function App() {
       // re-run regexp_replace six times per row across millions of rows.
       const materializeEligibleSQL = `
         CREATE TEMP TABLE ${ELIGIBLE_ROWS_TABLE_NAME} AS
-        WITH scanned AS (
+        WITH raw AS (
+          SELECT
+            csv.*,
+            ${coOwnerFlags.propertyRowCountSQL} AS __property_row_count,
+            ${coOwnerFlags.ownerRowCountSQL} AS __owner_row_count,
+            ${coOwnerFlags.jointNameSQL} AS __joint_name,
+            ${ownerNameNormSQL} AS __owner_norm
+          ${sourceSQL} AS csv
+        ), scanned AS (
           SELECT
             csv.*,
             ${ownerKeySQL} AS __owner_key,
             TRY_CAST(csv."${csvCashBalanceCol}" AS DOUBLE) AS __balance,
-            TRY_CAST(csv."${csvNoOfOwnersCol}" AS INTEGER) AS __no_of_owners,
-            ${ownerNameNormSQL} AS __owner_norm
-          ${sourceSQL} AS csv
+            TRY_CAST(csv."${csvNoOfOwnersCol}" AS INTEGER) AS __no_of_owners
+          FROM raw AS csv
           WHERE ${claimGateSQL}
             AND ${addressRequiredSQL}
             AND ${propertyTypeFilterSQL}
         )
-        SELECT s.* EXCLUDE (__owner_norm)
+        SELECT s.* EXCLUDE (
+          __owner_norm, __property_row_count, __owner_row_count, __joint_name
+        )
         FROM scanned s
         LEFT JOIN airtable_leads_lookup AS air
           ON TRIM(UPPER(CAST(s."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
           AND TRIM(UPPER(CAST(s."${csvOwnerNameCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."OWNER_NAME" AS VARCHAR)))
         WHERE ${ownerEntitySQL}
+          AND ${coOwnershipSQL}
           AND air."PROPERTY_ID" IS NULL
       `;
 
@@ -606,6 +662,12 @@ function App() {
       const claimParts = buildClaimGateParts(ownerColumns);
       const typeParts = buildPropertyTypeFilterParts(propertyTypeColumns);
       const entityParts = buildOwnerEntityFilterParts(ownerEntityColumns, 'owner_norm');
+      const coOwnerParts = buildCoOwnershipFilterParts({
+        propertyRowCountRef: 'property_row_count',
+        ownerRowCountRef: 'owner_row_count',
+        jointNameRef: 'joint_name',
+        reportedOwnersRef: 'reported_owners',
+      });
       const flag = (sql: string | null): string => sql ?? 'TRUE';
 
       const funnelSQL = `
@@ -621,6 +683,10 @@ function App() {
             ${flag(typeParts.cusipSQL)} AS cu_ok,
             ${flag(typeParts.securitiesNameSQL)} AS sn_ok,
             ${ownerNameNormSQL} AS owner_norm,
+            ${coOwnerFlags.propertyRowCountSQL} AS property_row_count,
+            ${coOwnerFlags.ownerRowCountSQL} AS owner_row_count,
+            ${coOwnerFlags.jointNameSQL} AS joint_name,
+            ${coOwnerFlags.reportedOwnersSQL} AS reported_owners,
             EXISTS (
               SELECT 1 FROM airtable_leads_lookup air
               WHERE TRIM(UPPER(CAST(csv."${csvPropIdCol}" AS VARCHAR))) = TRIM(UPPER(CAST(air."PROPERTY_ID" AS VARCHAR)))
@@ -633,10 +699,15 @@ function App() {
             (NOT bad_claim AND pend_ok AND paid_ok) AS ok_claim,
             (kw_ok AND code_ok AND sh_ok AND cu_ok AND sn_ok) AS ok_cash,
             ${flag(entityParts.hardEntitySQL)} AS ent_hard_ok,
-            ${flag(entityParts.softEntitySQL)} AS ent_soft_ok
+            ${flag(entityParts.softEntitySQL)} AS ent_soft_ok,
+            ${flag(coOwnerParts.reportedOwnersOkSQL)} AS co_count_ok,
+            ${flag(coOwnerParts.soleOwnerOkSQL)} AS co_shared_ok,
+            ${flag(coOwnerParts.jointNameOkSQL)} AS co_joint_ok
           FROM flags
         ), gated AS (
-          SELECT *, (ent_hard_ok AND ent_soft_ok) AS ok_person
+          SELECT *,
+            (ent_hard_ok AND ent_soft_ok) AS ok_person,
+            (co_count_ok AND co_shared_ok AND co_joint_ok) AS ok_sole_owner
           FROM staged
         )
         SELECT
@@ -652,7 +723,10 @@ function App() {
           COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND kw_ok AND code_ok AND sh_ok AND cu_ok AND NOT sn_ok)::BIGINT AS c_securities_named,
           COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND NOT ent_hard_ok)::BIGINT AS c_entity_keyword,
           COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ent_hard_ok AND NOT ent_soft_ok)::BIGINT AS c_entity_orgname,
-          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ok_person AND in_crm)::BIGINT AS c_in_crm
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ok_person AND NOT co_count_ok)::BIGINT AS c_co_reported,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ok_person AND co_count_ok AND NOT co_shared_ok)::BIGINT AS c_co_shared,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ok_person AND co_count_ok AND co_shared_ok AND NOT co_joint_ok)::BIGINT AS c_co_joint,
+          COUNT(*) FILTER (WHERE ok_claim AND addr_ok AND ok_cash AND ok_person AND ok_sole_owner AND in_crm)::BIGINT AS c_in_crm
         FROM gated
       `;
 
@@ -757,6 +831,9 @@ function App() {
         securitiesNamed: cell(funnelRow, 'c_securities_named'),
         entityKeyword: cell(funnelRow, 'c_entity_keyword'),
         entityOrgName: cell(funnelRow, 'c_entity_orgname'),
+        coOwnerReported: cell(funnelRow, 'c_co_reported'),
+        coOwnerShared: cell(funnelRow, 'c_co_shared'),
+        coOwnerJointName: cell(funnelRow, 'c_co_joint'),
         alreadyInCrm: cell(funnelRow, 'c_in_crm'),
         belowThreshold: cell(thresholdRow, 'rows_below_threshold'),
         qualifiedRows: String(countRow?.row_count ?? 0),
