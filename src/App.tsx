@@ -1249,51 +1249,6 @@ function App() {
                   </p>
                 </div>
 
-                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3">
-                  <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
-                    Unclaimed Only (Always On)
-                  </p>
-                  <p className="mt-1 text-xs text-slate-300">
-                    Properties with any pending or paid claim are removed first, before any other rule runs.
-                  </p>
-                </div>
-
-                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-3">
-                  <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-400">
-                    Cash-Only Policy (Always On)
-                  </p>
-                  <p className="mt-1 text-xs text-slate-300">
-                    Securities and safe-deposit box properties are excluded automatically before any lead is counted.
-                  </p>
-                </div>
-
-                <div className="rounded-xl border border-fuchsia-500/20 bg-fuchsia-500/5 p-3">
-                  <p className="text-[10px] font-semibold uppercase tracking-wider text-fuchsia-400">
-                    Individual Owners Only (Always On)
-                  </p>
-                  <p className="mt-1 text-xs text-slate-300">
-                    Records owned by companies, LLCs, trusts, estates, banks, churches, funds and government
-                    bodies are removed. Only natural persons are exported.
-                  </p>
-                  <p className="mt-2 text-[10px] text-slate-500">
-                    Surnames that double as business words (Church, Banks, Temple, Lodge, Co) are kept when the
-                    name reads as a person.
-                  </p>
-                </div>
-
-                <div className="rounded-xl border border-sky-500/20 bg-sky-500/5 p-3">
-                  <p className="text-[10px] font-semibold uppercase tracking-wider text-sky-400">
-                    Owner Grouping (Always On)
-                  </p>
-                  <p className="mt-1 text-xs text-slate-300">
-                    Properties sharing an exact owner name and address count as one owner. An owner qualifies on
-                    their combined total, and all of their properties export together.
-                  </p>
-                  <p className="mt-2 text-[10px] text-slate-500">
-                    Rows without a street address are excluded. Properties already in Airtable are removed before
-                    totalling.
-                  </p>
-                </div>
               </div>
             </section>
           </div>
