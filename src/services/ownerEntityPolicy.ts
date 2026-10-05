@@ -67,7 +67,11 @@ const ENTITY_HARD_KEYWORDS = [
   'schools', 'department', 'dept', 'bureau', 'commission', 'authority',
   'administration', 'municipal', 'township', 'district', 'commonwealth',
   'county of', 'city of', 'town of', 'state of', 'local', 'club', 'fraternal',
-  'veterans', 'legion',
+  'veterans', 'legion', 'treasury',
+  // Benefit and pension plans - `GOLD COAST HEALTH PLAN`, `EMPLOYEE PENSION
+  // PLAN`, `CMB PENSION PLAN`. Verified over all 3,779,672 owner names: never
+  // a person.
+  'plan', 'plans',
   // Religious
   'baptist', 'methodist', 'catholic', 'lutheran', 'presbyterian', 'episcopal',
   'pentecostal', 'congregation', 'synagogue', 'mosque', 'islamic', 'ministries',
@@ -83,11 +87,15 @@ const ENTITY_HARD_KEYWORDS = [
   'supplies', 'products', 'group', 'partners', 'partnership', 'ventures',
   'international', 'worldwide', 'communications', 'media', 'publishing',
   'productions', 'entertainment', 'broadcasting', 'radio', 'films', 'pictures',
-  'studios',
+  'studios', 'television', 'cinema', 'cinemas',
   // Medical
   'laboratories', 'laboratory', 'labs', 'pharmaceutical', 'pharmacy', 'pharm',
   'medical', 'clinic', 'hospital', 'healthcare', 'dental', 'diagnostic',
   'diagnostics', 'imaging', 'surgical', 'veterinary',
+  // `medica` is how this dataset truncates `MEDICAL` at the column width -
+  // `NORTH OAK REGIONAL MEDICA`, `VERDUGO HILLS MEDICA`. Truncation means the
+  // spelled-out keyword never fires, so the stub needs its own entry.
+  'medica',
   // Trade / retail / property
   'motors', 'automotive', 'trucking', 'transport', 'transportation',
   'logistics', 'airlines', 'tire', 'restaurant', 'catering', 'hotel', 'motel',
